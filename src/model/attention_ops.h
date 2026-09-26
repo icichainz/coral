@@ -10,13 +10,13 @@
 //   argmax_f32_partial, argmax_f32_final             GPU greedy argmax
 //   rope_yarn_f32                                    standalone RoPE (tests / prefill)
 //   attn_qkv_rope                                    rmsnorm + QKV + bias + RoPE + KV-cache write
-//   attn_decode_partial, attn_decode_combine         split-K attention with sinks
+//   attn_decode_fused                                split-K attention with sinks (+ in-kernel merge)
 //
-// Attention decode per layer = 4 dispatches:
+// Attention decode per layer = 3 dispatches:
 //   1. attn_qkv_rope        norm(residual) -> q (fp32, roped), k/v (bf16) into the cache slot
-//   2. attn_decode_partial  (kv_heads x splits) threadgroups
-//   3. attn_decode_combine  merge splits + sink -> attn_out fp32 [Q]
-//   4. gemv_bf16_r*         residual += Wo . attn_out + bo
+//   2. attn_decode_fused    (kv_heads x splits) threadgroups; the last one per kv head
+//                           merges the splits + sink -> attn_out fp32 [Q]
+//   3. gemv_bf16_r*         residual += Wo . attn_out + bo
 //
 // Alignment relied on (checked at encode time, std::invalid_argument on violation):
 //   * bf16 weight / norm tensors: GPU address multiple of 8 bytes (the gpt-oss
@@ -52,6 +52,7 @@ struct AttnScratch {
     gpu::Buffer attn_out;   // fp32 [Q]      attention output (pre o_proj)
     gpu::Buffer partials;   // fp32 [heads][max_splits][head_dim+2]
     gpu::Buffer rope;       // see make_rope_table
+    gpu::Buffer counters;   // uint [kv_heads], split-merge election (zero between dispatches)
     uint32_t max_positions = 0;
     uint32_t max_splits = 0;
 };
@@ -69,7 +70,7 @@ AttnSplit attn_split(uint32_t n);
 //   residual += o_proj(attention(rope(qkv(rmsnorm(residual)))))
 // Writes K/V for `pos` into the cache (ring slot pos % window for sliding
 // layers). Does not touch cache.length. Requires pos < cache.capacity (full
-// layers) and pos < scratch.max_positions. 4 dispatches.
+// layers) and pos < scratch.max_positions. 3 dispatches.
 void encode_attention_decode(gpu::Device& dev, gpu::CommandStream& cs, const ModelConfig& cfg,
                              const LayerWeights& L, uint32_t layer_index, bool sliding, uint32_t kv_slot,
                              const KVCache& cache, uint32_t pos,
@@ -77,7 +78,7 @@ void encode_attention_decode(gpu::Device& dev, gpu::CommandStream& cs, const Mod
 
 // The pieces of encode_attention_decode, for timing and finer-grained use:
 //   encode_attn_qkv  : dispatch 1 (writes s.q and the cache row for `pos`)
-//   encode_attn_core : dispatches 2-3 (reads s.q + cache, writes s.attn_out)
+//   encode_attn_core : dispatch 2 (reads s.q + cache, writes s.attn_out)
 void encode_attn_qkv(gpu::Device& dev, gpu::CommandStream& cs, const ModelConfig& cfg,
                      const LayerWeights& L, uint32_t layer_index, bool sliding, uint32_t kv_slot,
                      const KVCache& cache, uint32_t pos,

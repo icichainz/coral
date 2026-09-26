@@ -166,7 +166,7 @@ CORAL_TEST(moe_router_topk_matches_cpu) {
             auto cs = dev.stream();
             cs.begin();
             encode_moe_router(dev, cs, c, L.mlp_norm, L.router_w, L.router_b, xb, s, true);
-            encode_moe_gate_up(dev, cs, c, L, s);   // top-k + softmax happen here
+            encode_moe_gate_up(dev, cs, c, L, s);
             cs.submit_and_wait();
 
             auto xn = ref_rmsnorm(x, L.mlp_norm, c.rms_norm_eps);
@@ -402,89 +402,30 @@ CORAL_TEST(moe_lab_sweep) {
         for (uint32_t i = 0; i < H; ++i) er = std::max(er, double(std::fabs(res.as<float>()[i] - ref_res[i])));
         return std::pair<double, double>(eh, er);
     };
-    const char* only = std::getenv("CORAL_MOE_LAB_ONLY");
-    const bool q4 = std::getenv("CORAL_MOE_LAB_Q4") != nullptr;
-    if (!only || std::string(only) == "gu")
+    // Kernel shapes (see MoeKernelConfig); the lane-mapping and loop-structure
+    // variants that lost are documented in src/kernels/moe.metal.
     for (uint32_t pairs : {1u, 2u, 4u})
         for (uint32_t sg : {1u, 2u, 4u, 8u}) {
             moe_kernel_config() = def;
-            moe_kernel_config().gu_pairs = pairs; moe_kernel_config().gu_sg = sg; moe_kernel_config().gu_q4 = q4;
+            moe_kernel_config().gu_pairs = pairs; moe_kernel_config().gu_sg = sg;
             const double t = time([&](const LayerWeights& L) { encode_moe_gate_up(dev, cs, c, L, s); });
             auto [eh, er] = check();
-            std::printf("        gate_up pairs %u sg %2u: %6.1f us %5.0f GB/s  (dh %.1e)\n", pairs, sg, t * 1e6, gu_b / t / 1e9, eh);
+            std::printf("        gate_up pairs %u sg %u: %6.1f us %5.0f GB/s  (dh %.1e)\n", pairs, sg, t * 1e6, gu_b / t / 1e9, eh);
+            CHECK(eh < 1e-3);
         }
-    if (!only || std::string(only) == "dn")
-    for (uint32_t rows : {1u, 2u, 4u, 8u})
+    for (uint32_t rows : {1u, 2u, 4u})
         for (uint32_t sg : {1u, 2u, 4u, 8u}) {
-            if (rows == 8 && !q4) continue;
             moe_kernel_config() = def;
-            moe_kernel_config().dn_rows = rows; moe_kernel_config().dn_sg = sg; moe_kernel_config().dn_q4 = q4;
+            moe_kernel_config().dn_rows = rows; moe_kernel_config().dn_sg = sg;
             const double t = time([&](const LayerWeights& L) { encode_moe_down(dev, cs, c, L, res, s); });
             auto [eh, er] = check();
-            std::printf("        down rows %u sg %2u: %6.1f us %5.0f GB/s  (dres %.1e)\n", rows, sg, t * 1e6, dn_b / t / 1e9, er);
+            std::printf("        down rows %u sg %u: %6.1f us %5.0f GB/s  (dres %.1e)\n", rows, sg, t * 1e6, dn_b / t / 1e9, er);
+            CHECK(er < 1e-2);
         }
-    if (only && std::string(only) == "forced") {
-        for (uint32_t pairs : {1u, 2u, 4u}) {
-            moe_kernel_config() = def;
-            moe_kernel_config().gu_pairs = pairs; moe_kernel_config().gu_sg = 1; moe_kernel_config().gu_q4 = true;
-            const double t0 = time([&](const LayerWeights& L) { encode_moe_gate_up(dev, cs, c, L, s); });
-            const double t1 = time([&](const LayerWeights& L) { encode_moe_gate_up(dev, cs, c, L, s, true); });
-            std::printf("        gate_up q4 p%u sg1: topk %.1f us, forced %.1f us (%.0f GB/s)\n", pairs, t0 * 1e6, t1 * 1e6, gu_b / t1 / 1e9);
-        }
-        // Empty-ish dispatch cost: router alone.
-        const double tr = time([&](const LayerWeights& L) { encode_moe_router(dev, cs, c, L.mlp_norm, L.router_w, L.router_b, res, s, true); });
-        std::printf("        router %.1f us\n", tr * 1e6);
-    }
-    if (only && std::string(only) == "lpb") {
-        for (uint32_t lpb : {1u, 2u, 4u})
-            for (uint32_t pairs : {1u, 2u, 4u})
-                for (uint32_t sg : {1u, 2u, 4u}) {
-                    moe_kernel_config() = def;
-                    moe_kernel_config().gu_pairs = pairs; moe_kernel_config().gu_sg = sg; moe_kernel_config().gu_lpb = lpb;
-                    const double t = time([&](const LayerWeights& L) { encode_moe_gate_up(dev, cs, c, L, s); });
-                    auto [eh, er] = check();
-                    std::printf("        gate_up lpb %u pairs %u sg %u: %6.1f us %5.0f GB/s  (dh %.1e)\n", lpb, pairs, sg, t * 1e6, gu_b / t / 1e9, eh);
-                }
-        for (uint32_t lpb : {1u, 2u, 4u})
-            for (uint32_t rows : {2u, 4u, 8u})
-                for (uint32_t sg : {1u, 2u, 4u, 8u}) {
-                    if (lpb == 1 && rows == 8) continue;
-                    moe_kernel_config() = def;
-                    moe_kernel_config().dn_rows = rows; moe_kernel_config().dn_sg = sg; moe_kernel_config().dn_lpb = lpb;
-                    const double t = time([&](const LayerWeights& L) { encode_moe_down(dev, cs, c, L, res, s); });
-                    auto [eh, er] = check();
-                    std::printf("        down lpb %u rows %u sg %u: %6.1f us %5.0f GB/s  (dres %.1e)\n", lpb, rows, sg, t * 1e6, dn_b / t / 1e9, er);
-                }
-    }
-    if (only && std::string(only) == "unroll") {
-        for (uint32_t u : {2u, 3u, 4u})
-            for (uint32_t pairs : {1u, 2u})
-                for (uint32_t sg : {1u, 2u, 4u}) {
-                    moe_kernel_config() = def;
-                    moe_kernel_config().gu_pairs = pairs; moe_kernel_config().gu_sg = sg; moe_kernel_config().gu_unroll = u;
-                    const double t = time([&](const LayerWeights& L) { encode_moe_gate_up(dev, cs, c, L, s); });
-                    auto [eh, er] = check();
-                    std::printf("        gate_up unroll %u pairs %u sg %u: %6.1f us %5.0f GB/s  (dh %.1e)\n", u, pairs, sg, t * 1e6, gu_b / t / 1e9, eh);
-                }
-        for (uint32_t u : {2u, 3u, 4u})
-            for (uint32_t rows : {2u, 4u})
-                for (uint32_t sg : {1u, 2u, 4u, 8u}) {
-                    moe_kernel_config() = def;
-                    moe_kernel_config().dn_rows = rows; moe_kernel_config().dn_sg = sg; moe_kernel_config().dn_unroll = u;
-                    const double t = time([&](const LayerWeights& L) { encode_moe_down(dev, cs, c, L, res, s); });
-                    auto [eh, er] = check();
-                    std::printf("        down unroll %u rows %u sg %u: %6.1f us %5.0f GB/s  (dres %.1e)\n", u, rows, sg, t * 1e6, dn_b / t / 1e9, er);
-                }
-    }
-    if (only && std::string(only) == "ks")
-    for (uint32_t rows : {1u, 2u, 4u, 8u})
-        for (uint32_t sp : {1u, 2u}) {
-            moe_kernel_config() = def;
-            moe_kernel_config().dn_rows = rows; moe_kernel_config().dn_split = sp;
-            const double t = time([&](const LayerWeights& L) { encode_moe_down(dev, cs, c, L, res, s); });
-            auto [eh, er] = check();
-            std::printf("        down-ks rows %u split %u: %6.1f us %5.0f GB/s  (dres %.1e)\n", rows, sp, t * 1e6, dn_b / t / 1e9, er);
-        }
+    moe_kernel_config() = def;
+    const double tr = time([&](const LayerWeights& L) { encode_moe_router(dev, cs, c, L.mlp_norm, L.router_w, L.router_b, res, s, true); });
+    const double tg = time([&](const LayerWeights& L) { encode_moe_gate_up(dev, cs, c, L, s); });
+    std::printf("        router (+ top-k) %.1f us | gate_up %.1f us\n", tr * 1e6, tg * 1e6);
     moe_kernel_config() = def;
 }
 
@@ -525,6 +466,31 @@ CORAL_TEST(moe_lab_roofline) {
             }
             std::printf("        chunk %u B/sg %.0f MB: %.1f us %.0f GB/s\n", chunk * 16, mb, best * 1e6, bytes / best / 1e9);
         }
+    }
+    // Rotating over the 24 real wq tensors (23.6 MB each, no SLC reuse): the
+    // best a 24 MB streaming dispatch can do.
+    for (uint32_t chunk : {90u, 360u, 1440u}) {
+        double best = 1e30;
+        const uint32_t n16 = uint32_t(w.layers[0].wq.nbytes / 16), nch = (n16 + chunk - 1) / chunk;
+        for (int rep = 0; rep < 8; ++rep) {
+            cs.begin();
+            for (int i = 0; i < 24; ++i) {
+                const auto& t = w.layers[i].wq;
+                cs.dispatch(dev.kernel("lab_chunk_read"), gpu::Args().buffer(0, t.buf, t.offset / 16 * 16).buffer(1, out).value(2, P{n16, chunk}),
+                            {(nch + 7) / 8}, {256});
+            }
+            best = std::min(best, timed_submit(cs) / 24);
+        }
+        std::printf("        wq x24 chunk %u B/sg: %.1f us %.0f GB/s\n", chunk * 16, best * 1e6, w.layers[0].wq.nbytes / best / 1e9);
+    }
+    for (uint32_t groups : {1u, 32u, 360u, 1440u}) {
+        double best = 1e30;
+        for (int rep = 0; rep < 8; ++rep) {
+            cs.begin();
+            for (int i = 0; i < 200; ++i) cs.dispatch(dev.kernel("lab_empty"), gpu::Args().buffer(0, out), {groups}, {256});
+            best = std::min(best, timed_submit(cs) / 200);
+        }
+        std::printf("        empty dispatch + barrier, %u groups: %.2f us\n", groups, best * 1e6);
     }
     (void)w;
 }

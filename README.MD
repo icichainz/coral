@@ -72,16 +72,45 @@ echo "Name three primes." | ./build/coral run models/gpt-oss-20b --temp 0.7 --to
 `--ctx` (KV cache positions; default max(8192, prompt + n)), `--raw`,
 `--reasoning low|medium|high`, `--system`.
 
-Measured on an M2 Max (400 GB/s), gpt-oss-20b, greedy:
+Measured on an M2 Max (400 GB/s), gpt-oss-20b, greedy (`coral bench`; GB/s
+from `Model::decode_bytes_per_token`, 3.14 GB/token with the int8 lm_head):
 
 | | ms/token | tok/s | GB/s | host encode |
 |---|---|---|---|---|
-| decode @ ctx ~100-500 | 13.4 | 74.6 | 282 | ~230 us |
-| decode @ ctx ~2000 | 13.8 | 72.4 | 276 | ~240 us |
-| prefill (token-by-token, 16/submit) | 10.2 | 98 | | |
+| decode @ ctx ~500 | 9.9-10.1 | 99-101 | 313-318 | ~250 us, hidden (pipelined) |
+| decode @ ctx ~2250 | 10.5 | 95 | 304 | ~240 us, hidden |
+| decode @ ctx ~500, `CORAL_LM_HEAD=bf16` | 11.4 | 88 | 324 | hidden |
+| prefill (token-by-token, 16/submit), 1000 tokens | 8.5 | 117 | | |
 
-The final RMSNorm + lm_head GEMV alone is 3.2 ms/token (1.16 GB at 357 GB/s),
-so the 8-bit unembedding in step 7 is the largest single win left.
+Before step 7 tuning: 13.4 ms/token (74.5 tok/s, 282 GB/s of 3.72 GB).
+
+Where a decode step goes (per layer, rotating over all 24 layers, M2 Max):
+
+| stage | bytes | time | GB/s |
+|---|---|---|---|
+| fused rmsnorm + QKV + RoPE + KV write | 29.5 MB | 94 us | 312 |
+| attention core (split-K + in-kernel merge), ctx 300 | ~0.6 MB | 21 us | |
+| o_proj + residual | 23.6 MB | 75 us | 314 |
+| router + top-k | 0.2 MB | 10-12 us | |
+| gate_up + SwiGLU (4 experts, MXFP4) | 35.3 MB | 106-110 us | 322-333 |
+| down + weighted residual add | 17.6 MB | 61 us | 288 |
+| lm_head (int8, final norm folded), once | 580 MB | 1.61 ms | 360 |
+
+For reference, a pure streaming read of a 23.6 MB tensor per dispatch
+(rotating over the 24 real `wq` tensors, no cache reuse) reaches 332 GB/s,
+and an empty dispatch + barrier costs 2-4 us (`CORAL_MOE_LAB=1 coral_tests
+moe_lab_roofline`); the bf16/MXFP4 GEMVs are within ~5% of that.
+
+Knobs (environment, override `ModelOptions`): `CORAL_LM_HEAD=bf16|int8`
+(unembedding precision; int8 = per-row absmax scales, quantized on the GPU at
+load, +580 MB; on the reference prompts identical argmax to bf16, corr(top-64)
+>= 0.99983), `CORAL_PIPELINE=0|1` (pipelined greedy decode: step t+1 is
+encoded and submitted, its token read on the GPU from step t's argmax, while
+step t runs; one wasted step when generation stops).
+
+Stage benchmarks: `CORAL_MOE_BENCH=1 coral_tests moe_bench`,
+`CORAL_ATTN_BENCH=1 [CORAL_ATTN_POS=2000] coral_tests attn_bench`,
+`CORAL_MOE_LAB=1 coral_tests moe_lab` (kernel-shape sweep + roofline).
 
 ## Serve
 
@@ -112,9 +141,11 @@ include/coral/     public C++ interfaces (one header per module)
 src/
   gpu/metal_backend.mm   Metal 4 implementation of gpu.h
   gpu/kernels.cpp        includes the generated shaders.inc
-  kernels/               MSL: gemv_bf16, gemv_mxfp4, moe, attention, rope, norm,
-                         embed, embed_f32, mxfp4, smoke (+ common.h)
-  model/attention_ops.*  attention half of a layer (4 dispatches)
+  kernels/               MSL: gemv_bf16, gemv_int8, gemv_mxfp4, moe, attention, rope,
+                         norm, embed, embed_f32, mxfp4, smoke, zz_lab (dev roofline)
+                         (+ common.h)
+  model/attention_ops.*  attention half of a layer (3 dispatches)
+  model/gemv_i8.*        int8 lm_head: load-time quantization + GEMV
   model/moe_ops.*        MoE half of a layer (3 dispatches)
   model/weights.*        zero-copy tensor binding
   loader/safetensors.cpp
@@ -138,8 +169,8 @@ scripts/                 Python dev tooling
 * Vocab 201088 (o200k_harmony); `<|return|>`=200002 and `<|call|>`=200012 stop.
 * Bytes read per decoded token, roughly: attention 1.3 GB + active experts
   1.3 GB + unembedding 1.2 GB (bf16). On an M2 Max (about 400 GB/s) that caps
-  single-stream decode near 100 tok/s. Quantizing the unembedding to 8-bit
-  removes ~0.6 GB/token.
+  single-stream decode near 100 tok/s. The int8 unembedding (default)
+  removes ~0.58 GB/token.
 
 ## Roadmap
 
@@ -168,7 +199,11 @@ scripts/                 Python dev tooling
    `/v1/chat/completions` (streaming and not, `reasoning_content`, tools and
    `tool_calls`, `reasoning_effort`), `/v1/completions`, `/v1/models`,
    `/health`. Continuous batching across requests is future work.
-7. **Tuning**: prefill GEMMs with `simdgroup_matrix` for long prompts (prefill
-   currently replays the decode path per token), 8-bit unembedding,
-   overlapping host encode of token t+1 with GPU work of token t, speculative
-   decoding, Metal 4 binary archives for instant startup, gpt-oss-120b.
+7. **Tuning** — decode path done (13.4 -> ~10.0 ms/token): MXFP4 GEMVs with
+   a 4-lanes-per-block mapping (MoE 235 -> 173 us/layer), int8 lm_head
+   (3.2 -> 1.6 ms), attention split merge fused into the split kernel and
+   top-k fused into the router (172 -> 148 dispatches), pipelined greedy
+   decode hiding host encode + submit latency. Next: prefill GEMMs with
+   `simdgroup_matrix` for long prompts (prefill currently replays the decode
+   path per token), speculative decoding, Metal 4 binary archives for instant
+   startup, gpt-oss-120b.

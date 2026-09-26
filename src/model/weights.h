@@ -64,6 +64,12 @@ Weights bind_weights(const ModelConfig& cfg, const Safetensors& st);
 // Throw std::invalid_argument if `m` is not a gpt-oss model.
 const Weights&     model_weights(const Model& m);
 const Safetensors& model_tensors(const Model& m);
+// Unembedding precision of a loaded gpt-oss model (see ModelOptions::lm_head);
+// switching to int8 quantizes on first use (~0.1 s, 580 MB).
+void model_set_lm_head_int8(Model& m, bool on);
+bool model_lm_head_int8(const Model& m);
+// Pipelined greedy decode on/off (see ModelOptions::pipeline_greedy).
+void model_set_pipeline(Model& m, bool on);
 
 // Record an embedding gather: out[t] = embed[ids[t]] for t < n_tokens.
 // `ids` holds int32 token ids; `out` receives bf16 [n_tokens][H].

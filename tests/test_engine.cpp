@@ -76,7 +76,7 @@ CORAL_TEST(engine_harmony_hello) {
     CHECK_EQ(st.generated_tokens, uint32_t(out.size()));
     CHECK_EQ(st.decode_steps + 1, st.generated_tokens);
     CHECK_EQ(st.prompt_tokens, uint32_t(req.prompt.size()));
-    CHECK(st.decode_forward.dispatches == size_t(st.decode_steps) * 172);
+    CHECK(st.decode_forward.dispatches == size_t(st.decode_steps) * 148);   // 146 + GPU argmax (2)
 }
 
 CORAL_TEST(engine_matches_reference_continuation) {

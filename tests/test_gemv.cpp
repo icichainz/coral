@@ -16,6 +16,7 @@
 #include "coral/model.h"
 #include "coral/safetensors.h"
 #include "../src/model/attention_ops.h"
+#include "../src/model/gemv_i8.h"
 #include "../src/model/weights.h"
 
 using namespace coral;
@@ -269,4 +270,57 @@ CORAL_TEST(gemv_bf16_lm_head_bandwidth) {
     o.norm = &w.final_norm;
     check_gemv(w.lm_head, x.as<float>(), y.as<float>(), nullptr, o, 1009, "lm_head");
     CHECK(best > 150.0);   // loose floor; target >= 300 GB/s on M2 Max
+}
+
+// int8 lm_head: load-time quantization and the int8 GEMV (+ folded RMSNorm)
+// against CPU references on the real weights, plus bandwidth per variant.
+CORAL_TEST(gemv_i8_lm_head_matches_cpu) {
+    Model& m = attn_test_model();
+    auto& dev = attn_test_device();
+    const Weights& w = model_weights(m);
+    const uint32_t V = uint32_t(w.lm_head.dim(0)), H = uint32_t(w.lm_head.dim(1));
+    const QuantI8 q = quantize_rows_i8(dev, w.lm_head);
+    CHECK_EQ(q.rows, V);
+    CHECK_EQ(q.K, H);
+    // Quantization: per-row absmax scale, |dequant - w| <= scale/2 (+ rounding slack).
+    for (uint32_t r = 0; r < V; r += 211) {
+        const uint16_t* wr = w.lm_head.as<uint16_t>() + size_t(r) * H;
+        float amax = 0;
+        for (uint32_t k = 0; k < H; ++k) amax = std::max(amax, std::fabs(bf16_to_f32(wr[k])));
+        const float sc = q.s.as<float>()[r];
+        CHECK_NEAR(sc, amax > 0 ? amax / 127.0f : 1.0f, 1e-6 * amax + 1e-12);
+        const int8_t* qr = q.q.as<int8_t>() + size_t(r) * H;
+        for (uint32_t k = 0; k < H; ++k) {
+            const double err = std::fabs(double(qr[k]) * sc - bf16_to_f32(wr[k]));
+            if (err > 0.5001 * sc) { std::printf("        row %u k %u q %d w %g s %g\n", r, k, qr[k], bf16_to_f32(wr[k]), sc); CHECK(err <= 0.5001 * sc); }
+        }
+    }
+    gpu::Buffer x = random_f32(dev, H, 31, 3.0f), y = dev.alloc(size_t(V) * 4);
+    const double bytes = double(q.bytes());
+    for (bool norm : {false, true})
+        for (uint32_t R : {1u, 2u, 4u, 8u}) {
+            auto cs = dev.stream();
+            cs.begin();
+            encode_gemv_i8(dev, cs, q, x, 0, y, 0, norm ? &w.final_norm : nullptr, m.config().rms_norm_eps, R);
+            cs.submit_and_wait();
+            // Correctness vs double on the int8 data.
+            double inv = 1.0;
+            if (norm) { double ss = 0; for (uint32_t k = 0; k < H; ++k) ss += double(x.as<float>()[k]) * x.as<float>()[k]; inv = 1.0 / std::sqrt(ss / H + m.config().rms_norm_eps); }
+            for (uint32_t r = 0; r < V; r += 997) {
+                const int8_t* qr = q.q.as<int8_t>() + size_t(r) * H;
+                double acc = 0, mag = 0;
+                for (uint32_t k = 0; k < H; ++k) {
+                    const double t = double(qr[k]) * x.as<float>()[k] * (norm ? double(bfv(w.final_norm, k)) : 1.0);
+                    acc += t; mag += std::fabs(t);
+                }
+                const double sc = q.s.as<float>()[r];
+                acc *= inv * sc; mag *= inv * sc;
+                CHECK_NEAR(y.as<float>()[r], acc, 2e-6 * mag + 1e-6);
+            }
+            cs.begin();
+            for (int i = 0; i < 20; ++i)
+                encode_gemv_i8(dev, cs, q, x, 0, y, 0, norm ? &w.final_norm : nullptr, m.config().rms_norm_eps, R);
+            const double t = cs.submit_and_wait() / 20;
+            std::printf("        lm_head int8 gemv%s R=%u: %.3f ms  %.1f GB/s\n", norm ? " (norm fused)" : "", R, t * 1e3, bytes / t * 1e-9);
+        }
 }

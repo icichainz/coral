@@ -42,7 +42,6 @@ struct ArgmaxParams { uint32_t n; };
 struct RopeParams { uint32_t n_heads; };
 struct QkvParams { uint32_t H, Q, KV; float eps; };
 struct AttnParams { uint32_t n, chunk, kv_heads, max_splits; float scale; };
-struct CombineParams { uint32_t n_splits, max_splits; };
 
 } // namespace
 
@@ -103,6 +102,7 @@ AttnScratch make_attn_scratch(gpu::Device& dev, const ModelConfig& c, uint32_t m
     s.attn_out = dev.alloc(size_t(c.q_dim()) * 4, true);
     s.partials = dev.alloc(size_t(c.num_heads) * kMaxSplits * (kHeadDim + 2) * 4, true);
     s.rope = make_rope_table(dev, c, max_positions);
+    s.counters = dev.alloc(size_t(c.num_kv_heads) * 4, true);
     return s;
 }
 
@@ -114,8 +114,10 @@ uint32_t kv_slot_for_layer(const ModelConfig& c, uint32_t layer) {
 }
 
 AttnSplit attn_split(uint32_t n) {
+    // One 32-position block per split up to 512 positions (short dependency
+    // chains, more threadgroups), then at most kMaxSplits splits.
     uint32_t chunk = (n + kMaxSplits - 1) / kMaxSplits;
-    chunk = std::max<uint32_t>(64, (chunk + 31) / 32 * 32);
+    chunk = std::max<uint32_t>(32, (chunk + 31) / 32 * 32);
     return {chunk, std::max<uint32_t>(1, (n + chunk - 1) / chunk)};
 }
 
@@ -261,14 +263,12 @@ void encode_attn_core(gpu::Device& dev, gpu::CommandStream& cs, const ModelConfi
     check_bf16(L.sinks, "attention", 2);
     const AttnSplit sp = attn_split(g.n);
     const AttnParams ap{g.n, sp.chunk, c.num_kv_heads, s.max_splits, 1.0f / std::sqrt(float(kHeadDim))};
-    cs.dispatch(dev.kernel("attn_decode_partial"),
+    require(s.counters.valid() && s.counters.size() >= size_t(c.num_kv_heads) * 4, where + ": scratch counters missing");
+    cs.dispatch(dev.kernel("attn_decode_fused"),
                 gpu::Args().buffer(0, s.q).buffer(1, *g.k, g.layer_base).buffer(2, *g.v, g.layer_base)
-                           .buffer(3, s.partials).value(4, ap),
+                           .buffer(3, s.partials).buffer(4, L.sinks.buf, L.sinks.offset).buffer(5, s.attn_out)
+                           .buffer(6, s.counters).value(7, ap),
                 {c.num_kv_heads, sp.splits}, {kGroup * 32});
-    cs.dispatch(dev.kernel("attn_decode_combine"),
-                gpu::Args().buffer(0, s.partials).buffer(1, L.sinks.buf, L.sinks.offset).buffer(2, s.attn_out)
-                           .value(3, CombineParams{sp.splits, s.max_splits}),
-                {c.num_heads}, {kHeadDim});
 }
 
 void encode_attention_decode(gpu::Device& dev, gpu::CommandStream& cs, const ModelConfig& c,
@@ -277,9 +277,9 @@ void encode_attention_decode(gpu::Device& dev, gpu::CommandStream& cs, const Mod
                              const gpu::Buffer& residual, size_t residual_offset, AttnScratch& s) {
     // 1. rmsnorm + QKV + bias + RoPE + KV write.
     encode_attn_qkv(dev, cs, c, L, layer_index, sliding, kv_slot, cache, pos, residual, residual_offset, s);
-    // 2-3. attention partials over the cache slots, merge + sink -> s.attn_out.
+    // 2. attention partials over the cache slots, merge + sink -> s.attn_out.
     encode_attn_core(dev, cs, c, L, layer_index, sliding, kv_slot, cache, pos, s);
-    // 4. residual += Wo . attn + bo.
+    // 3. residual += Wo . attn + bo.
     check_bf16(L.wo, "attention");
     GemvOptions o;
     o.bias = &L.bo;

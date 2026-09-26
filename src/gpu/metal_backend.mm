@@ -326,6 +326,14 @@ void CommandStream::begin() {
     [I.cmd beginCommandBufferWithAllocator:I.allocator];
     I.enc = [I.cmd computeCommandEncoder];
     if (!I.enc) fail("computeCommandEncoder");
+    // Metal 4 command buffers committed to one queue may overlap. Order this
+    // command buffer's work after everything committed before it (GPU-side,
+    // no CPU wait), so a stream can consume results of another stream's
+    // still-running submit (e.g. the next decode step reading this step's
+    // argmax) and streams never race on shared scratch buffers.
+    [I.enc barrierAfterQueueStages:MTLStageDispatch | MTLStageBlit
+                      beforeStages:MTLStageDispatch | MTLStageBlit
+                 visibilityOptions:MTL4VisibilityOptionDevice];
     I.param_head = 0;
     I.table_head = 0;
     I.dispatches = 0;

@@ -5,8 +5,9 @@
 // Single-sequence generation (src/engine/engine.cpp): prefill the prompt,
 // then one command buffer per generated token. Greedy decoding
 // (temperature 0, no repetition penalty) uses the GPU argmax and reads back
-// 4 bytes per token; otherwise the sampler reads the fp32 logits in place
-// (unified memory, no copy).
+// 4 bytes per token, pipelined by Model::decode_argmax (step t+1 is encoded
+// and submitted while step t runs); otherwise the sampler reads the fp32
+// logits in place (unified memory, no copy).
 #pragma once
 
 #include <cstdint>

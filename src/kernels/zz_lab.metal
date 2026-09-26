@@ -1,7 +1,9 @@
 #include "common.h"
 
-// Development aid: raw streaming-read bandwidth (roofline for the GEMV kernels).
-// Each thread reads UNROLL uint4 per iteration over a grid-stride loop.
+// Development aid (tests/test_moe.cpp moe_lab_roofline, CORAL_MOE_LAB=1):
+// raw streaming-read bandwidth, the roofline for the GEMV kernels, and the
+// fixed cost of an empty dispatch + barrier. Not used by the engine.
+// lab_stream_read: grid-stride loop, one uint4 per thread per iteration.
 struct LabReadParams { uint n16; uint unroll; };
 
 kernel void lab_stream_read(device const uint4* src [[buffer(0)]],
@@ -28,4 +30,8 @@ kernel void lab_chunk_read(device const uint4* src [[buffer(0)]],
     uint4 a = 0;
     for (uint i = lane; i < chunk; i += 32) if (base + i < p.n16) a ^= src[base + i];
     if (a.x == 0x12345678u && a.y == 0x9abcdef0u) out[0] = a.z;
+}
+
+kernel void lab_empty(device uint* out [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
+    if (gid == 0xFFFFFFFFu) out[0] = 1;
 }

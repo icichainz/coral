@@ -96,6 +96,10 @@ private:
 };
 
 // Records dispatches, submits them as one command buffer, and waits.
+// All streams of a Device commit to one queue, and each submit's work starts
+// only after all work submitted before it (from any stream) has completed:
+// a submit may consume, on the GPU, results of an earlier submit that the CPU
+// has not waited for yet.
 class CommandStream {
 public:
     ~CommandStream();

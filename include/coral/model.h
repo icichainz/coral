@@ -20,8 +20,9 @@
 // window of 128 on even layers, full causal on odd layers.
 //
 // Decode (M = 1) is one command buffer per token: embed (1 dispatch) +
-// 24 x [attention (4) + MoE (3)] + fused final-norm/lm_head GEMV (1)
-// [+ GPU argmax (2)] = 170 (172 with argmax) dispatches.
+// 24 x [attention (3) + MoE (3)] + fused final-norm/lm_head GEMV (1; int8
+// weights by default, see ModelOptions)
+// [+ GPU argmax (2)] = 146 (148 with argmax) dispatches.
 // Prefill currently replays the decode path token by token, 16 tokens per
 // command buffer; a batched GEMM prefill is roadmap step 7.
 #pragma once
@@ -55,10 +56,30 @@ struct ForwardStats {
     uint32_t tokens = 0;         // positions processed
 };
 
+// Load-time options.
+struct ModelOptions {
+    // Unembedding precision. Int8 (default): at load, lm_head is quantized on
+    // the GPU to int8 with one fp32 scale per row (symmetric absmax/127) into
+    // a private buffer (~580 MB for 20b; the bf16 original stays mmap'd but is
+    // not read by decode). Halves the bytes of the largest single GEMV;
+    // measured on the mlx reference cases: identical argmax, corr(top-64 vs
+    // bf16) > 0.9995 (tests/test_forward.cpp). Bf16 = exact checkpoint weights.
+    // The environment variable CORAL_LM_HEAD=bf16|int8 overrides this field.
+    enum class LmHead { Int8, Bf16 };
+    LmHead lm_head = LmHead::Int8;
+
+    // Pipelined greedy decode: decode_argmax() submits step p+1 (token taken
+    // on the GPU from step p's argmax) before waiting for step p, hiding host
+    // encode and submit latency. Costs one wasted speculative step when the
+    // caller stops or continues differently. CORAL_PIPELINE=0|1 overrides.
+    bool pipeline_greedy = true;
+};
+
 class Model {
 public:
     // Load config + weights from `model_dir`; binds all shards to the GPU with no copy.
     static std::unique_ptr<Model> load(gpu::Device& dev, const std::string& model_dir);  // throws
+    static std::unique_ptr<Model> load(gpu::Device& dev, const std::string& model_dir, const ModelOptions& opt);
     virtual ~Model() = default;
 
     virtual const ModelConfig& config() const = 0;
@@ -93,6 +114,10 @@ public:
     virtual void decode(gpu::CommandStream& cs, KVCache& cache, int32_t token,
                         gpu::Buffer& logits_out, ForwardStats* stats = nullptr) = 0;
     // Same, plus the GPU argmax (only 4 bytes are read back for greedy decoding).
+    // With ModelOptions::pipeline_greedy (default) the step after this one is
+    // already submitted when this returns (see gptoss.cpp), `cs` is unused and
+    // `logits_out` is re-pointed at an internal buffer holding this step's
+    // logits (valid until the next call into the model).
     virtual int32_t decode_argmax(gpu::CommandStream& cs, KVCache& cache, int32_t token,
                                   gpu::Buffer& logits_out, ForwardStats* stats = nullptr) = 0;
 

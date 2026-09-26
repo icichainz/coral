@@ -3,6 +3,8 @@
 #include "test.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -230,7 +232,7 @@ CORAL_TEST(attn_decode_layer_matches_cpu) {
             auto cs = dev.stream();
             cs.begin();
             encode_attention_decode(dev, cs, c, L, layer, sliding, slot, cache, pos, residual, 0, s);
-            CHECK_EQ(cs.dispatch_count(), size_t(4));
+            CHECK_EQ(cs.dispatch_count(), size_t(3));
             cs.submit_and_wait();
 
             auto xn = ref.push_kv(x.data(), pos);
@@ -402,5 +404,52 @@ CORAL_TEST(attn_zz_profile) {
     for (uint32_t pos : {100u, 1000u, 4095u}) {
       double t = time(100, [&](gpu::CommandStream& cs) { encode_attn_core(dev, cs, c, L, 1, false, 0, cache, pos, s); });
       std::printf("        core pos %u: %.1f us\n", pos, t * 1e6);
+    }
+}
+
+// Per-stage timing over all 24 layers in one submit (no cache reuse between
+// consecutive dispatches, as in the real forward). Set CORAL_ATTN_BENCH=1.
+CORAL_TEST(attn_bench_stages) {
+    if (!std::getenv("CORAL_ATTN_BENCH")) SKIP("set CORAL_ATTN_BENCH=1");
+    Model& m = attn_test_model();
+    auto& dev = attn_test_device();
+    const ModelConfig& c = m.config();
+    const Weights& w = model_weights(m);
+    const uint32_t pos = std::getenv("CORAL_ATTN_POS") ? uint32_t(std::atoi(std::getenv("CORAL_ATTN_POS"))) : 300;
+    KVCache cache = m.new_cache(pos + 16);
+    AttnScratch s = make_attn_scratch(dev, c, pos + 16);
+    gpu::Buffer residual = dev.alloc(c.hidden_size * 4, true);
+    for (uint32_t i = 0; i < c.hidden_size; ++i) residual.as<float>()[i] = 0.01f * float(i % 13);
+    auto cs = dev.stream();
+    auto time = [&](auto&& enc) {
+        double best = 1e30;
+        for (int rep = 0; rep < 10; ++rep) {
+            cs.begin();
+            for (uint32_t l = 0; l < c.num_layers; ++l) enc(l);
+            const auto t0 = std::chrono::steady_clock::now();
+            cs.submit_and_wait();
+            best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
+        return best / c.num_layers;
+    };
+    const auto& L0 = w.layers[0];
+    const double qkv_b = double(L0.wq.nbytes + L0.wk.nbytes + L0.wv.nbytes), o_b = double(L0.wo.nbytes);
+    const double tq = time([&](uint32_t l) { const auto& L = w.layers[l]; encode_attn_qkv(dev, cs, c, L, l, L.sliding, kv_slot_for_layer(c, l), cache, pos, residual, 0, s); });
+    const double tc = time([&](uint32_t l) { const auto& L = w.layers[l]; encode_attn_core(dev, cs, c, L, l, L.sliding, kv_slot_for_layer(c, l), cache, pos, s); });
+    GemvOptions o; o.bias = nullptr; o.accumulate = true;
+    const double to = time([&](uint32_t l) { const auto& L = w.layers[l]; GemvOptions oo; oo.bias = &L.bo; oo.accumulate = true;
+                                             encode_gemv_bf16(dev, cs, L.wo, s.attn_out, 0, residual, 0, oo); });
+    const double ta = time([&](uint32_t l) { const auto& L = w.layers[l]; encode_attention_decode(dev, cs, c, L, l, L.sliding, kv_slot_for_layer(c, l), cache, pos, residual, 0, s); });
+    std::printf("        qkv %.1f us %.0f GB/s | core %.1f us | o_proj %.1f us %.0f GB/s | block %.1f us (ctx %u)\n",
+                tq * 1e6, qkv_b / tq / 1e9, tc * 1e6, to * 1e6, o_b / to / 1e9, ta * 1e6, pos + 1);
+    for (uint32_t R : {1u, 2u, 4u, 8u}) {
+        const double t = time([&](uint32_t l) { const auto& L = w.layers[l]; GemvOptions oo; oo.bias = &L.bo; oo.accumulate = true; oo.rows_per_simdgroup = R;
+                                                encode_gemv_bf16(dev, cs, L.wo, s.attn_out, 0, residual, 0, oo); });
+        const double t2 = time([&](uint32_t l) { const auto& L = w.layers[l]; GemvOptions oo; oo.norm = &L.attn_norm; oo.rows_per_simdgroup = R;
+                                                encode_gemv_bf16(dev, cs, L.wq, residual, 0, s.q, 0, oo); });
+        const double t3 = time([&](uint32_t l) { const auto& L = w.layers[l]; GemvOptions oo; oo.rows_per_simdgroup = R;
+                                                encode_gemv_bf16(dev, cs, L.wq, residual, 0, s.q, 0, oo); });
+        std::printf("        R=%u: o_proj %.1f us %.0f GB/s | wq+norm %.1f us %.0f GB/s | wq plain %.1f us %.0f GB/s\n", R,
+                    t * 1e6, o_b / t / 1e9, t2 * 1e6, double(L0.wq.nbytes) / t2 / 1e9, t3 * 1e6, double(L0.wq.nbytes) / t3 / 1e9);
     }
 }

@@ -18,6 +18,7 @@
 #include "coral/json.h"
 #include "coral/model.h"
 #include "coral/tokenizer.h"
+#include "../src/model/weights.h"
 
 using namespace coral;
 
@@ -213,4 +214,90 @@ CORAL_TEST(forward_encode_only_argmax) {
     m.encode_decode(cs, tiny, 1, nullptr);
     CHECK_THROWS(m.encode_decode(cs, tiny, 2, nullptr));
     cs.submit_and_wait();
+}
+
+// int8 lm_head (the default) against the exact bf16 lm_head on the reference
+// prompts: same argmax everywhere, corr over the bf16 top-64 > 0.9995.
+CORAL_TEST(forward_int8_lm_head_matches_bf16) {
+    const std::string path = "tests/data/logits_reference.json";
+    if (!std::filesystem::exists(path)) SKIP("tests/data/logits_reference.json absent");
+    Model& m = attn_test_model();
+    std::ifstream f(path);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const Json ref = Json::parse(ss.str());
+    const bool was = model_lm_head_int8(m);
+    double worst_corr = 1.0, worst_full = 1.0, worst_maxd = 0.0;
+    for (const Json& c : ref["cases"].as_array()) {
+        std::vector<int32_t> tokens;
+        for (const Json& t : c["tokens"].as_array()) tokens.push_back(int32_t(t.as_int()));
+        model_set_lm_head_int8(m, false);
+        const Run a = run_greedy(tokens, 1);
+        model_set_lm_head_int8(m, true);
+        const Run b = run_greedy(tokens, 1);
+        CHECK_EQ(cpu_argmax(a.logits), cpu_argmax(b.logits));
+        CHECK_EQ(a.greedy[0], b.greedy[0]);
+        std::vector<int32_t> idx(a.logits.size());
+        for (size_t i = 0; i < idx.size(); ++i) idx[i] = int32_t(i);
+        std::partial_sort(idx.begin(), idx.begin() + 64, idx.end(),
+                          [&](int32_t x, int32_t y) { return a.logits[x] > a.logits[y]; });
+        auto corr = [&](size_t n, const int32_t* ids) {
+            double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const double x = a.logits[ids ? ids[i] : i], y = b.logits[ids ? ids[i] : i];
+                sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
+            }
+            const double cov = sxy / n - sx / n * sy / n;
+            return cov / std::sqrt((sxx / n - sx / n * sx / n) * (syy / n - sy / n * sy / n));
+        };
+        const double c64 = corr(64, idx.data()), call = corr(a.logits.size(), nullptr);
+        double maxd = 0;
+        for (int i = 0; i < 64; ++i) maxd = std::max(maxd, double(std::fabs(a.logits[idx[i]] - b.logits[idx[i]])));
+        std::printf("        %zu tok: argmax %d, corr(bf16 top-64) %.6f, corr(all) %.6f, max|d| top-64 %.4f (top logit %.3f)\n",
+                    tokens.size(), a.greedy[0], c64, call, maxd, a.logits[idx[0]]);
+        worst_corr = std::min(worst_corr, c64);
+        worst_full = std::min(worst_full, call);
+        worst_maxd = std::max(worst_maxd, maxd);
+        CHECK(c64 > 0.9995);
+    }
+    std::printf("        worst: corr(top-64) %.6f, corr(all) %.6f, max|d| %.4f\n", worst_corr, worst_full, worst_maxd);
+    model_set_lm_head_int8(m, was);
+}
+
+// Pipelined greedy decode (default) is bitwise identical to the synchronous
+// path, including when the caller breaks the chain (different token, other
+// cache, a plain decode in between).
+CORAL_TEST(forward_pipelined_decode_matches_sync) {
+    auto& dev = attn_test_device();
+    Model& m = attn_test_model();
+    const std::vector<int32_t> prompt = {976, 9029, 328, 10128, 382};
+    const uint32_t V = m.config().vocab_size;
+    // script: -1 = continue with the previous argmax, else force that token.
+    const std::vector<int32_t> script = {-1, -1, -1, 1000, -1, -1, 7, 7, -1, -1, -1, -1};
+    auto run = [&](bool pipe, std::vector<std::vector<float>>* logits) {
+        model_set_pipeline(m, pipe);
+        auto cs = dev.stream();
+        KVCache cache = m.new_cache(64), other = m.new_cache(16);
+        gpu::Buffer lg;
+        std::vector<int32_t> out;
+        int32_t tok = m.prefill_argmax(cs, cache, prompt, lg);
+        for (size_t i = 0; i < script.size(); ++i) {
+            const int32_t in = script[i] < 0 ? tok : script[i];
+            if (i == 5) {   // unrelated work on another cache mid-sequence
+                gpu::Buffer l2;
+                (void)m.decode_argmax(cs, other, 42, l2);
+            }
+            tok = m.decode_argmax(cs, cache, in, lg);
+            out.push_back(tok);
+            logits->emplace_back(lg.as<float>(), lg.as<float>() + V);
+        }
+        CHECK_EQ(cache.length, uint32_t(prompt.size() + script.size()));
+        return out;
+    };
+    std::vector<std::vector<float>> la, lb;
+    const auto a = run(false, &la), b = run(true, &lb);
+    model_set_pipeline(m, true);
+    CHECK(a == b);
+    for (size_t i = 0; i < la.size(); ++i) CHECK(la[i] == lb[i]);
+    std::printf("        %zu steps identical (tokens and logits)\n", a.size());
 }
