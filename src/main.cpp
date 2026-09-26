@@ -323,9 +323,10 @@ int cmd_bench(int argc, char** argv) {
     int32_t tok = m.prefill_argmax(cs, cache, prompt, logits, &pf);
     const double prefill_wall = since(t0);
     std::printf("device        %s\n", L.dev->info().name.c_str());
-    std::printf("prefill       %zu tokens in %.1f ms = %.1f tok/s  (token-by-token decode path, %u submits; "
-                "GEMM prefill is roadmap step 7)\n",
-                prompt.size(), prefill_wall * 1e3, prompt.size() / prefill_wall, pf.submits);
+    std::printf("prefill       %zu tokens in %.1f ms = %.1f tok/s  (%s path, %u submits, %zu dispatches)\n",
+                prompt.size(), prefill_wall * 1e3, prompt.size() / prefill_wall,
+                pf.submits > 0 && pf.dispatches / pf.submits > 200 ? "batched GEMM" : "token-by-token",
+                pf.submits, pf.dispatches);
 
     struct Window { double wall = 0, gpu = 0, enc = 0; uint64_t bytes = 0; size_t disp = 0; uint32_t n = 0; };
     auto report = [&](const char* label, const Window& w, uint32_t ctx_end) {

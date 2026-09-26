@@ -70,6 +70,16 @@ void model_set_lm_head_int8(Model& m, bool on);
 bool model_lm_head_int8(const Model& m);
 // Pipelined greedy decode on/off (see ModelOptions::pipeline_greedy).
 void model_set_pipeline(Model& m, bool on);
+// Batched prefill (prefill_ops.h) on/off (default on; CORAL_PREFILL=token|batched
+// sets the load-time default); off = token-by-token through the decode path.
+void model_set_batched_prefill(Model& m, bool on);
+bool model_batched_prefill(const Model& m);
+// Maximum rows per batched-prefill chunk (default 1024; CORAL_PREFILL_CHUNK).
+void model_set_prefill_chunk(Model& m, uint32_t rows);
+// Shortest prompt that takes the batched path (default: see gptoss.cpp
+// kMinBatched; 0 restores it; clamped to >= 2 — a single token always uses
+// the decode path).
+void model_set_prefill_min_tokens(Model& m, uint32_t n);
 
 // Record an embedding gather: out[t] = embed[ids[t]] for t < n_tokens.
 // `ids` holds int32 token ids; `out` receives bf16 [n_tokens][H].

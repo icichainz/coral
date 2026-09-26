@@ -23,8 +23,12 @@
 // 24 x [attention (3) + MoE (3)] + fused final-norm/lm_head GEMV (1; int8
 // weights by default, see ModelOptions)
 // [+ GPU argmax (2)] = 146 (148 with argmax) dispatches.
-// Prefill currently replays the decode path token by token, 16 tokens per
-// command buffer; a batched GEMM prefill is roadmap step 7.
+// Prefill of two or more tokens is batched (src/model/prefill_ops.h): the
+// prompt is processed in chunks of up to 1024 positions, one command buffer
+// per chunk, with simdgroup-matrix GEMMs for the projections, grouped MXFP4
+// GEMMs for the experts and a flash-attention kernel; only the last position
+// gets the unembedding. CORAL_PREFILL=token selects the token-by-token decode
+// path (16 tokens per command buffer) instead.
 #pragma once
 
 #include <cstdint>

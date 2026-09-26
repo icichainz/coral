@@ -23,6 +23,7 @@
 #include "attention_ops.h"
 #include "gemv_i8.h"
 #include "moe_ops.h"
+#include "prefill_ops.h"
 #include "weights.h"
 
 namespace coral {
@@ -50,6 +51,12 @@ public:
         set_lm_head_int8(int8);
         pipeline_ = opt.pipeline_greedy;
         if (const char* e = std::getenv("CORAL_PIPELINE")) pipeline_ = std::strcmp(e, "0") != 0;
+        if (const char* e = std::getenv("CORAL_PREFILL")) {
+            if (!std::strcmp(e, "token")) batched_ = false;
+            else if (!std::strcmp(e, "batched")) batched_ = true;
+            else throw std::invalid_argument(std::string("CORAL_PREFILL must be token or batched, got '") + e + "'");
+        }
+        if (const char* e = std::getenv("CORAL_PREFILL_CHUNK")) chunk_ = std::max(2, std::atoi(e));
     }
 
     // Switch the unembedding precision (quantizes on first use of int8).
@@ -62,6 +69,10 @@ public:
     }
     bool lm_head_int8() const { return lm_int8_; }
     void set_pipeline(bool on) { retire_spec(); pipeline_ = on; }
+    void set_batched_prefill(bool on) { batched_ = on; }
+    bool batched_prefill() const { return batched_; }
+    void set_prefill_chunk(uint32_t n) { chunk_ = std::max<uint32_t>(2, n); }
+    void set_prefill_min_tokens(uint32_t n) { min_batched_ = n == 0 ? kMinBatched : std::max<uint32_t>(2, n); }
 
     const ModelConfig& config() const override { return cfg_; }
     const Weights& weights() const { return w_; }
@@ -117,36 +128,44 @@ public:
         }
 
         // 3. final RMSNorm folded into the lm_head GEMV, 4. optional argmax.
-        if (logits_out || argmax_out) {
-            gpu::Buffer& logits = logits_out ? *logits_out : logits_scratch_;
-            const size_t need = size_t(cfg_.vocab_size) * 4;
-            if (!logits.valid()) logits = dev_.alloc(need, true);
-            if (logits.size() < need) throw std::invalid_argument("decode: logits buffer smaller than vocab*4");
-            if (lm_int8_) {
-                encode_gemv_i8(dev_, cs, lm_i8_, residual_, 0, logits, 0, &w_.final_norm, cfg_.rms_norm_eps);
-            } else {
-                GemvOptions o;
-                o.norm = &w_.final_norm;
-                o.eps = cfg_.rms_norm_eps;
-                encode_gemv_bf16(dev_, cs, w_.lm_head, residual_, 0, logits, 0, o);
-            }
-            if (argmax_out) {
-                if (!argmax_out->valid()) *argmax_out = dev_.alloc(16, true);
-                encode_argmax_f32(dev_, cs, logits, 0, cfg_.vocab_size, *argmax_out, 0, argmax_scratch_);
-            }
-        }
+        encode_unembed(cs, residual_, 0, logits_out, argmax_out);
         cache.length = pos + 1;
+    }
+
+    // Final RMSNorm + lm_head on the fp32 row at x[x_offset] (+ GPU argmax).
+    // Nothing is recorded when both outputs are null.
+    void encode_unembed(gpu::CommandStream& cs, const gpu::Buffer& x, size_t x_offset,
+                        gpu::Buffer* logits_out, gpu::Buffer* argmax_out) {
+        if (!logits_out && !argmax_out) return;
+        gpu::Buffer& logits = logits_out ? *logits_out : logits_scratch_;
+        const size_t need = size_t(cfg_.vocab_size) * 4;
+        if (!logits.valid()) logits = dev_.alloc(need, true);
+        if (logits.size() < need) throw std::invalid_argument("decode: logits buffer smaller than vocab*4");
+        if (lm_int8_) {
+            encode_gemv_i8(dev_, cs, lm_i8_, x, x_offset, logits, 0, &w_.final_norm, cfg_.rms_norm_eps);
+        } else {
+            GemvOptions o;
+            o.norm = &w_.final_norm;
+            o.eps = cfg_.rms_norm_eps;
+            encode_gemv_bf16(dev_, cs, w_.lm_head, x, x_offset, logits, 0, o);
+        }
+        if (argmax_out) {
+            if (!argmax_out->valid()) *argmax_out = dev_.alloc(16, true);
+            encode_argmax_f32(dev_, cs, logits, 0, cfg_.vocab_size, *argmax_out, 0, argmax_scratch_);
+        }
     }
 
     void prefill(gpu::CommandStream& cs, KVCache& cache, std::span<const int32_t> tokens,
                  gpu::Buffer& logits_out, ForwardStats* stats) override {
         retire_spec();
-        run_tokens(cs, cache, tokens, logits_out, nullptr, stats);
+        if (use_batched(tokens.size())) run_batched(cs, cache, tokens, logits_out, nullptr, stats);
+        else run_tokens(cs, cache, tokens, logits_out, nullptr, stats);
     }
     int32_t prefill_argmax(gpu::CommandStream& cs, KVCache& cache, std::span<const int32_t> tokens,
                            gpu::Buffer& logits_out, ForwardStats* stats) override {
         retire_spec();
-        run_tokens(cs, cache, tokens, logits_out, &argmax_buf_, stats);
+        if (use_batched(tokens.size())) run_batched(cs, cache, tokens, logits_out, &argmax_buf_, stats);
+        else run_tokens(cs, cache, tokens, logits_out, &argmax_buf_, stats);
         return argmax_buf_.as<int32_t>()[0];
     }
     void decode(gpu::CommandStream& cs, KVCache& cache, int32_t token,
@@ -303,6 +322,15 @@ private:
     // Tokens per command buffer in prefill: 16 x 146 dispatches stays well
     // inside the backend's 4096-dispatch argument-table ring.
     static constexpr uint32_t kPrefillTokensPerSubmit = 16;
+    // Batched prefill: prompts of at least kMinBatched tokens (shorter ones:
+    // token by token — measured crossover 5-6 tokens on M2 Max, test_prefill.cpp
+    // prefill_zz_crossover: 4 tokens 39 vs 47 ms, 6 tokens 58 vs 55 ms,
+    // 64 tokens 596 vs 119 ms), chunks of at most chunk_ rows
+    // (CORAL_PREFILL_CHUNK overrides).
+    static constexpr uint32_t kMinBatched = 6;
+    // Chunk 1024 vs 512 on M2 Max (coral bench --ctx N): 993 vs 969 tok/s at
+    // 1024 tokens, 992 vs 976 at 2048 (fuller expert tiles); scratch ~160 MB.
+    static constexpr uint32_t kDefaultChunk = 1024;
 
     // Run `tokens` through the decode path, kPrefillTokensPerSubmit per
     // submit; only the last one gets the unembedding (+ argmax).
@@ -343,6 +371,68 @@ private:
         if (stats) stats->tokens += uint32_t(tokens.size());
     }
 
+    bool use_batched(size_t n) const { return batched_ && n >= min_batched_; }
+
+    // Batched prefill (prefill_ops.h): the prompt is split into
+    // ceil(n / chunk_) near-equal chunks; each chunk is one command buffer of
+    // 1 (embed) + 24 x [attention 5 (+1 ring update on sliding layers) + MoE 6]
+    // = 277 dispatches, and the last one adds the final-norm + lm_head GEMV
+    // (+ argmax: 280) for its last row only. Chunks run back to back on `cs`;
+    // the KV cache carries the context from one chunk to the next.
+    void run_batched(gpu::CommandStream& cs, KVCache& cache, std::span<const int32_t> tokens,
+                     gpu::Buffer& logits_out, gpu::Buffer* argmax_out, ForwardStats* stats) {
+        if (tokens.empty()) throw std::invalid_argument("prefill: no tokens");
+        if (size_t(cache.length) + tokens.size() > cache.capacity)
+            throw std::out_of_range("prefill: " + std::to_string(tokens.size()) + " tokens at position " +
+                                    std::to_string(cache.length) + " exceed KV cache capacity " +
+                                    std::to_string(cache.capacity));
+        const uint32_t V = uint32_t(w_.embed.dim(0));
+        for (int32_t t : tokens)
+            if (t < 0 || uint32_t(t) >= V) throw std::out_of_range("prefill: token id " + std::to_string(t) + " out of range");
+        ensure_scratch(cache.capacity);
+        const size_t n = tokens.size();
+        const size_t n_chunks = (n + chunk_ - 1) / chunk_;
+        const uint32_t per = uint32_t((n + n_chunks - 1) / n_chunks);
+        if (pf_.max_rows < per) pf_ = make_prefill_scratch(dev_, cfg_, per);
+        const uint32_t H = cfg_.hidden_size;
+        using clk = std::chrono::steady_clock;
+        size_t i = 0;
+        while (i < n) {
+            const uint32_t M = uint32_t(std::min<size_t>(per, n - i));
+            const bool last = i + M == n;
+            const uint32_t pos0 = cache.length;
+            const auto t0 = clk::now();
+            cs.begin();   // waits for the previous chunk: s.ids is free to overwrite
+            try {
+                std::memcpy(pf_.ids.data(), tokens.data() + i, size_t(M) * 4);
+                encode_prefill_embed(dev_, cs, w_.embed, M, pf_);
+                for (uint32_t l = 0; l < cfg_.num_layers; ++l) {
+                    const LayerWeights& L = w_.layers[l];
+                    encode_prefill_attention(dev_, cs, cfg_, L, l, kv_slot_[l], cache, pos0, M, attn_, pf_);
+                    encode_prefill_moe(dev_, cs, cfg_, L, M, pf_);
+                }
+                if (last) encode_unembed(cs, pf_.x, size_t(M - 1) * H * 4, &logits_out, argmax_out);
+            } catch (...) {
+                cs.submit();
+                cs.wait();
+                throw;
+            }
+            const size_t n_dispatch = cs.dispatch_count();
+            cs.submit();
+            const double enc = std::chrono::duration<double>(clk::now() - t0).count();
+            const double gpu = cs.wait();
+            cache.length = pos0 + M;
+            i += M;
+            if (stats) {
+                stats->encode_seconds += enc;
+                stats->gpu_seconds += gpu;
+                stats->dispatches += n_dispatch;
+                stats->submits += 1;
+            }
+        }
+        if (stats) stats->tokens += uint32_t(n);
+    }
+
     // Scratch shared by all layers/tokens; the rope table covers
     // [0, max_positions) and is rebuilt when a larger cache shows up.
     void ensure_scratch(uint32_t max_positions) {
@@ -353,9 +443,17 @@ private:
             argmax_buf_ = dev_.alloc(16, true);
             kv_slot_.resize(cfg_.num_layers);
             for (uint32_t l = 0; l < cfg_.num_layers; ++l) kv_slot_[l] = kv_slot_for_layer(cfg_, l);
+            // Build the batched-prefill pipelines now (first forward pass,
+            // usually a warm-up) rather than inside the first prompt.
+            for (const char* k : kPrefillKernels) (void)dev_.kernel(k);
         }
         if (attn_.max_positions < max_positions) attn_ = make_attn_scratch(dev_, cfg_, max_positions);
     }
+
+    static constexpr const char* kPrefillKernels[] = {
+        "pf_embed", "pf_gemm_bf16_m16", "pf_gemm_bf16_m32", "rmsnorm_f32", "pf_rope_kv", "pf_attention",
+        "pf_ring_write", "pf_router", "pf_moe_sort", "pf_moe_gate_up_m16", "pf_moe_gate_up_m32",
+        "pf_moe_down_m16", "pf_moe_down_m32", "pf_moe_reduce"};
 
     gpu::Device& dev_;
     ModelConfig cfg_;
@@ -368,6 +466,10 @@ private:
     // Forward-pass state (lazily created by ensure_scratch).
     AttnScratch attn_;
     MoeScratch moe_;
+    PrefillScratch pf_;           // batched prefill (lazily sized to the chunk)
+    bool batched_ = true;         // CORAL_PREFILL=token|batched
+    uint32_t chunk_ = kDefaultChunk;
+    uint32_t min_batched_ = kMinBatched;
     gpu::Buffer residual_;        // fp32 [H]
     gpu::Buffer logits_scratch_;  // fp32 [vocab] when the caller wants only the argmax
     gpu::Buffer argmax_scratch_;
@@ -403,6 +505,22 @@ void model_set_lm_head_int8(Model& m, bool on) {
     g->set_lm_head_int8(on);
 }
 bool model_lm_head_int8(const Model& m) { return as_gptoss(m).lm_head_int8(); }
+void model_set_batched_prefill(Model& m, bool on) {
+    auto* g = dynamic_cast<GptOssModel*>(&m);
+    if (!g) throw std::invalid_argument("not a gpt-oss model");
+    g->set_batched_prefill(on);
+}
+bool model_batched_prefill(const Model& m) { return as_gptoss(m).batched_prefill(); }
+void model_set_prefill_chunk(Model& m, uint32_t rows) {
+    auto* g = dynamic_cast<GptOssModel*>(&m);
+    if (!g) throw std::invalid_argument("not a gpt-oss model");
+    g->set_prefill_chunk(rows);
+}
+void model_set_prefill_min_tokens(Model& m, uint32_t n) {
+    auto* g = dynamic_cast<GptOssModel*>(&m);
+    if (!g) throw std::invalid_argument("not a gpt-oss model");
+    g->set_prefill_min_tokens(n);
+}
 void model_set_pipeline(Model& m, bool on) {
     auto* g = dynamic_cast<GptOssModel*>(&m);
     if (!g) throw std::invalid_argument("not a gpt-oss model");

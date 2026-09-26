@@ -80,7 +80,9 @@ from `Model::decode_bytes_per_token`, 3.14 GB/token with the int8 lm_head):
 | decode @ ctx ~500 | 9.9-10.1 | 99-101 | 313-318 | ~250 us, hidden (pipelined) |
 | decode @ ctx ~2250 | 10.5 | 95 | 304 | ~240 us, hidden |
 | decode @ ctx ~500, `CORAL_LM_HEAD=bf16` | 11.4 | 88 | 324 | hidden |
-| prefill (token-by-token, 16/submit), 1000 tokens | 8.5 | 117 | | |
+| prefill, batched, 512-token prompt | 1.1 | ~910 | | |
+| prefill, batched, 2048-token prompt | 0.97 | ~1030 | | |
+| prefill, token-by-token (`CORAL_PREFILL=token`), 1000 tokens | 8.5 | 117 | | |
 
 Before step 7 tuning: 13.4 ms/token (74.5 tok/s, 282 GB/s of 3.72 GB).
 
@@ -110,7 +112,18 @@ step t runs; one wasted step when generation stops).
 
 Stage benchmarks: `CORAL_MOE_BENCH=1 coral_tests moe_bench`,
 `CORAL_ATTN_BENCH=1 [CORAL_ATTN_POS=2000] coral_tests attn_bench`,
-`CORAL_MOE_LAB=1 coral_tests moe_lab` (kernel-shape sweep + roofline).
+`CORAL_MOE_LAB=1 coral_tests moe_lab` (kernel-shape sweep + roofline),
+`CORAL_PF_PROFILE=1 coral_tests prefill_zz` (batched-prefill stages per chunk
+size, token-vs-batched crossover).
+
+Batched prefill (`src/model/prefill_ops.h`): prompts of >= 6 tokens run in
+chunks of up to 1024 positions, one command buffer per chunk (277 dispatches:
+per layer rmsnorm, fused QKV GEMM, RoPE + KV staging, flash attention with
+sinks, ring update on sliding layers, o_proj GEMM, then router, expert sort,
+grouped MXFP4 gate_up + SwiGLU, grouped down, reduce). All GEMMs are
+`simdgroup_matrix<float>` with fp32 accumulation over exactly staged bf16 /
+MXFP4 weights (~8 TFLOP/s dense on M2 Max); results are bitwise independent
+of the chunking. Knobs: `CORAL_PREFILL=token|batched`, `CORAL_PREFILL_CHUNK=N`.
 
 ## Serve
 
@@ -142,11 +155,13 @@ src/
   gpu/metal_backend.mm   Metal 4 implementation of gpu.h
   gpu/kernels.cpp        includes the generated shaders.inc
   kernels/               MSL: gemv_bf16, gemv_int8, gemv_mxfp4, moe, attention, rope,
-                         norm, embed, embed_f32, mxfp4, smoke, zz_lab (dev roofline)
-                         (+ common.h)
+                         norm, embed, embed_f32, mxfp4, smoke, zz_lab (dev roofline),
+                         prefill_gemm, prefill_attn, prefill_moe (batched prefill)
+                         (+ common.h, prefill_core.h)
   model/attention_ops.*  attention half of a layer (3 dispatches)
   model/gemv_i8.*        int8 lm_head: load-time quantization + GEMV
   model/moe_ops.*        MoE half of a layer (3 dispatches)
+  model/prefill_ops.*    batched prefill (M > 1): GEMMs, attention, grouped MoE
   model/weights.*        zero-copy tensor binding
   loader/safetensors.cpp
   model/config.cpp, model/gptoss.cpp
@@ -203,7 +218,8 @@ scripts/                 Python dev tooling
    a 4-lanes-per-block mapping (MoE 235 -> 173 us/layer), int8 lm_head
    (3.2 -> 1.6 ms), attention split merge fused into the split kernel and
    top-k fused into the router (172 -> 148 dispatches), pipelined greedy
-   decode hiding host encode + submit latency. Next: prefill GEMMs with
-   `simdgroup_matrix` for long prompts (prefill currently replays the decode
-   path per token), speculative decoding, Metal 4 binary archives for instant
-   startup, gpt-oss-120b.
+   decode hiding host encode + submit latency. Batched prefill done (~117 ->
+   ~900-1030 prompt tok/s at 512-2048 tokens): simdgroup-matrix GEMMs,
+   grouped MXFP4 expert GEMMs over a GPU counting sort, flash attention with
+   sinks and a chunk-safe sliding ring. Next: speculative decoding, Metal 4
+   binary archives for instant startup, gpt-oss-120b.
