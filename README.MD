@@ -83,6 +83,18 @@ Measured on an M2 Max (400 GB/s), gpt-oss-20b, greedy:
 The final RMSNorm + lm_head GEMV alone is 3.2 ms/token (1.16 GB at 357 GB/s),
 so the 8-bit unembedding in step 7 is the largest single win left.
 
+## Serve
+
+```sh
+./build/coral serve models/gpt-oss-20b --port 8080 --reasoning low
+curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"gpt-oss-20b","messages":[{"role":"user","content":"Hi"}],"stream":true}'
+```
+
+The API is OpenAI-compatible: analysis-channel text arrives as
+`reasoning_content`, the final channel as `content`, and Harmony tool calls as
+`tool_calls`. One request generates at a time; others queue in order.
+
 ## Layout
 
 ```
@@ -96,7 +108,7 @@ include/coral/     public C++ interfaces (one header per module)
   harmony.h        Harmony chat format render/parse
   model.h          gpt-oss forward pass (decode/prefill), KVCache
   engine.h         generation loop, sampler
-  server.h         HTTP + OpenAI-compatible API                [interface]
+  server.h         kqueue HTTP/1.1 + OpenAI-compatible API
 src/
   gpu/metal_backend.mm   Metal 4 implementation of gpu.h
   gpu/kernels.cpp        includes the generated shaders.inc
@@ -109,7 +121,7 @@ src/
   model/config.cpp, model/gptoss.cpp
   tokenizer/tokenizer.cpp, tokenizer/harmony.cpp
   engine/engine.cpp
-  server/server.cpp
+  server/http.cpp, server/openai_api.cpp
   main.cpp               CLI: info | selftest | inspect | run | bench | serve
 tools/embed_shaders.cpp  build step: .metal -> shaders.inc
 tests/                   unit tests (make test)
@@ -146,11 +158,16 @@ scripts/                 Python dev tooling
    argmax, one command buffer per token), token-by-token prefill (16 tokens
    per command buffer), `Engine::generate` (GPU argmax for greedy, CPU
    sampler with temperature / top-k / top-p / repetition penalty otherwise),
-   `coral run` and `coral bench`. Verified against mlx-lm golden logits
-   (`tests/test_forward.cpp`): same argmax and 16/16 greedy continuation on
-   every reference case.
-6. **Server**: kqueue HTTP/1.1, SSE streaming, `/v1/chat/completions`,
-   `/v1/completions`, `/v1/models`; continuous batching across requests.
+   `coral run` and `coral bench`. Verified against fp32 mlx-lm golden logits
+   (`tests/test_forward.cpp`, 5 prompts): same argmax on every case; 4 of 5
+   correlate > 0.995 on the top-64 logits with 16/16 greedy tokens identical.
+   The fifth ("The capital of France is") has a router near-tie at layer 0
+   that a bf16 KV cache flips, so its continuation diverges after one token.
+6. **Server** — done: kqueue HTTP/1.1 (one IO thread, one generation worker,
+   chunked SSE, keep-alive, backpressure, client-disconnect cancellation),
+   `/v1/chat/completions` (streaming and not, `reasoning_content`, tools and
+   `tool_calls`, `reasoning_effort`), `/v1/completions`, `/v1/models`,
+   `/health`. Continuous batching across requests is future work.
 7. **Tuning**: prefill GEMMs with `simdgroup_matrix` for long prompts (prefill
    currently replays the decode path per token), 8-bit unembedding,
    overlapping host encode of token t+1 with GPU work of token t, speculative
