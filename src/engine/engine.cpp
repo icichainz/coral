@@ -92,6 +92,10 @@ public:
         (void)model_->decode_argmax(cs_, tmp, 0, logits_, nullptr);
     }
 
+    std::unique_ptr<BatchEngine> make_batch_engine(const BatchOptions& opt) override {
+        return BatchEngine::create(dev_, model_, opt);
+    }
+
     FinishReason generate(const GenerationRequest& req, const TokenCallback& on_token,
                           GenerationStats* stats_out) override {
         using clk = std::chrono::steady_clock;

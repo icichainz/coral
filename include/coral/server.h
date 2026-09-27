@@ -14,11 +14,13 @@
 //     the IO thread is woken through a kqueue EVFILT_USER event to flush them
 //     with non-blocking send(). A writer blocks (backpressure) while more than
 //     ServerOptions::max_pending_write_bytes are waiting for a slow client.
-//   * The OpenAI layer runs every generation on ONE worker thread that owns
-//     the Engine, fed by a FIFO queue; everything else is answered inline.
+//   * The OpenAI layer submits every generation to a BatchEngine driven by
+//     ONE worker thread (continuous batching: up to max_batch sequences decode
+//     together, the rest wait in FIFO order); everything else is answered
+//     inline.
 //   * The IO thread keeps reading while a response is in flight, so a peer
-//     close is seen at once: client_gone() turns true and generation stops at
-//     the next token.
+//     close is seen at once: client_gone() turns true and that sequence alone
+//     is cancelled at the next step.
 #pragma once
 
 #include <cstdint>
@@ -83,6 +85,7 @@ struct ServerOptions {
     std::string device_name;                         // reported by /health
     std::string default_reasoning = "medium";        // low | medium | high
     uint32_t kv_capacity = 0;                        // context size; 0 = engine default (grows per request)
+    uint32_t max_batch = 8;                          // sequences decoding together (continuous batching), 1..8
 };
 
 class HttpServer {
@@ -105,9 +108,10 @@ public:
 void send_json_error(HttpResponse& res, int status, std::string_view message,
                      std::string_view type = {}, std::string_view code = {});
 
-// Installs the OpenAI-compatible routes on `server`, backed by `engine`.
-// `engine` must outlive `server`. Generation runs on one worker thread owned
-// by the server (see attach()).
+// Installs the OpenAI-compatible routes on `server`, backed by a BatchEngine
+// made from `engine` (Engine::make_batch_engine, opts.max_batch). `engine`
+// must outlive `server` and must not be used while the server runs.
+// Generation runs on one worker thread owned by the server (see attach()).
 void install_openai_api(HttpServer& server, Engine& engine, const ServerOptions& opts);
 
 } // namespace coral

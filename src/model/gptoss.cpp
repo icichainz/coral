@@ -21,6 +21,7 @@
 #include <string>
 
 #include "attention_ops.h"
+#include "batch_ops.h"
 #include "gemv_i8.h"
 #include "moe_ops.h"
 #include "prefill_ops.h"
@@ -179,6 +180,71 @@ public:
         retire_spec();
         run_tokens(cs, cache, std::span<const int32_t>(&token, 1), logits_out, &argmax_buf_, stats);
         return argmax_buf_.as<int32_t>()[0];
+    }
+
+    // ---- multi-sequence decode (batch_ops.h) ---------------------------------
+    void encode_decode_batch(gpu::CommandStream& cs, std::span<KVCache* const> caches, std::span<const int32_t> tokens,
+                             gpu::Buffer* logits_out, gpu::Buffer* argmax_out) override {
+        const size_t B = caches.size();
+        if (B == 0 || B > kMaxDecodeBatch || tokens.size() != B)
+            throw std::invalid_argument("decode_batch: need 1.." + std::to_string(kMaxDecodeBatch) +
+                                        " caches and one token per cache");
+        retire_spec();
+        const uint32_t V = uint32_t(w_.embed.dim(0));
+        uint32_t max_cap = 0;
+        for (size_t i = 0; i < B; ++i) {
+            const KVCache* c = caches[i];
+            if (!c) throw std::invalid_argument("decode_batch: null cache");
+            for (size_t j = 0; j < i; ++j)
+                if (caches[j] == c || caches[j]->k_full.gpu_address() == c->k_full.gpu_address())
+                    throw std::invalid_argument("decode_batch: the same cache appears twice");
+            if (tokens[i] < 0 || uint32_t(tokens[i]) >= V)
+                throw std::out_of_range("decode_batch: token id " + std::to_string(tokens[i]) + " out of range");
+            if (c->length >= c->capacity)
+                throw std::out_of_range("decode_batch: KV cache full (capacity " + std::to_string(c->capacity) + ")");
+            max_cap = std::max(max_cap, c->capacity);
+        }
+        if (B == 1) {   // the single-sequence path (row 0 of the outputs = the M = 1 buffers)
+            encode_step(cs, *caches[0], tokens[0], nullptr, logits_out, argmax_out);
+            return;
+        }
+        ensure_scratch(max_cap);
+        if (!bs_.rows) bs_ = make_batch_scratch(dev_, cfg_);
+        const size_t lbytes = size_t(kMaxDecodeBatch) * cfg_.vocab_size * 4;
+        gpu::Buffer* lg = logits_out ? logits_out : argmax_out ? &blogits_ : nullptr;
+        if (lg && (!lg->valid() || lg->size() < B * size_t(cfg_.vocab_size) * 4)) *lg = dev_.alloc(lbytes, true);
+        if (argmax_out && (!argmax_out->valid() || argmax_out->size() < B * 4))
+            *argmax_out = dev_.alloc(kMaxDecodeBatch * 4 + 16, true);
+
+        BatchRow rows[kMaxDecodeBatch];
+        for (size_t i = 0; i < B; ++i) {
+            const KVCache& c = *caches[i];
+            rows[i] = BatchRow{c.k_full.gpu_address(), c.v_full.gpu_address(), c.k_slide.gpu_address(),
+                               c.v_slide.gpu_address(), c.length, c.capacity, 0, 0};
+        }
+        const std::span<const BatchRow> rs(rows, B);
+        encode_batch_embed(dev_, cs, w_.embed, tokens, bs_);
+        for (uint32_t l = 0; l < cfg_.num_layers; ++l) {
+            const LayerWeights& L = w_.layers[l];
+            encode_batch_attention(dev_, cs, cfg_, L, kv_slot_[l], rs, attn_, bs_);
+            encode_batch_moe(dev_, cs, cfg_, L, uint32_t(B), bs_);
+        }
+        if (lg) {
+            const uint32_t H = cfg_.hidden_size;
+            if (lm_int8_) {
+                encode_batch_unembed_i8(dev_, cs, lm_i8_, w_.final_norm, cfg_.rms_norm_eps, uint32_t(B), bs_, *lg,
+                                        cfg_.vocab_size);
+            } else {   // bf16 lm_head: one GEMV per row (reads the weights B times)
+                GemvOptions o;
+                o.norm = &w_.final_norm;
+                o.eps = cfg_.rms_norm_eps;
+                for (size_t i = 0; i < B; ++i)
+                    encode_gemv_bf16(dev_, cs, w_.lm_head, bs_.x, i * H * 4, *lg, i * size_t(cfg_.vocab_size) * 4, o);
+            }
+            if (argmax_out)
+                encode_batch_argmax(dev_, cs, *lg, cfg_.vocab_size, cfg_.vocab_size, uint32_t(B), bs_, *argmax_out);
+        }
+        for (size_t i = 0; i < B; ++i) caches[i]->length++;
     }
 
     // ---- pipelined greedy decode -------------------------------------------
@@ -467,6 +533,8 @@ private:
     AttnScratch attn_;
     MoeScratch moe_;
     PrefillScratch pf_;           // batched prefill (lazily sized to the chunk)
+    BatchScratch bs_;             // multi-sequence decode (lazily created)
+    gpu::Buffer blogits_;         // fp32 [kMaxDecodeBatch][vocab] when the caller wants only the argmax
     bool batched_ = true;         // CORAL_PREFILL=token|batched
     uint32_t chunk_ = kDefaultChunk;
     uint32_t min_batched_ = kMinBatched;
@@ -491,6 +559,36 @@ const GptOssModel& as_gptoss(const Model& m) {
 }
 
 } // namespace
+
+void Model::encode_decode_batch(gpu::CommandStream&, std::span<KVCache* const>, std::span<const int32_t>,
+                                gpu::Buffer*, gpu::Buffer*) {
+    throw std::logic_error("this model does not implement multi-sequence decode");
+}
+
+void Model::decode_batch(gpu::CommandStream& cs, std::span<KVCache* const> caches, std::span<const int32_t> tokens,
+                         gpu::Buffer* logits_out, gpu::Buffer* argmax_out, ForwardStats* stats) {
+    using clk = std::chrono::steady_clock;
+    const auto t0 = clk::now();
+    cs.begin();
+    try {
+        encode_decode_batch(cs, caches, tokens, logits_out, argmax_out);
+    } catch (...) {
+        cs.submit();
+        cs.wait();
+        throw;
+    }
+    const size_t n_dispatch = cs.dispatch_count();
+    cs.submit();
+    const double enc = std::chrono::duration<double>(clk::now() - t0).count();
+    const double gpu = cs.wait();
+    if (stats) {
+        stats->encode_seconds += enc;
+        stats->gpu_seconds += gpu;
+        stats->dispatches += n_dispatch;
+        stats->submits += 1;
+        stats->tokens += uint32_t(caches.size());
+    }
+}
 
 std::unique_ptr<Model> Model::load(gpu::Device& dev, const std::string& model_dir) {
     return load(dev, model_dir, ModelOptions{});

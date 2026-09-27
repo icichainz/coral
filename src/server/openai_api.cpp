@@ -1,17 +1,20 @@
-// OpenAI-compatible API on top of HttpServer and Engine.
+// OpenAI-compatible API on top of HttpServer and BatchEngine.
 //
-//   POST /v1/chat/completions  Harmony render -> Engine::generate -> harmony::Parser
+//   POST /v1/chat/completions  Harmony render -> BatchEngine sequence -> harmony::Parser
 //   POST /v1/completions       raw prompt (string or token ids), no Harmony
 //   GET  /v1/models, /health
 //
 // Requests are parsed and validated on the IO thread (bad requests never
-// wait behind a generation); generations run one at a time on a single
-// worker thread that owns the Engine (FIFO). A queued request whose client
-// disconnects is dropped before it starts; a running one is cancelled at the
-// next token through the TokenCallback.
+// wait behind a generation) and submitted to a BatchEngine (continuous
+// batching, up to ServerOptions::max_batch sequences decoding together; the
+// rest wait in FIFO order). One worker thread drives the engine; every
+// request is a session whose token callback streams deltas through its own
+// Harmony parser / stop filter. A client that disconnects cancels only its
+// own sequence, at the next step (queued ones never start).
 #include "coral/server.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -149,52 +152,28 @@ private:
 };
 
 // ---- the generation worker --------------------------------------------------
+// Drives the BatchEngine: step() while there is work, otherwise sleep until a
+// submit (or stop) wakes it.
 class Worker {
 public:
-    Worker() : th_([this] { loop(); }) {}
+    explicit Worker(BatchEngine& e) : e_(e), th_([this] { loop(); }) {}
     ~Worker() {
-        std::deque<std::function<void()>> dropped;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            stop_ = true;
-            dropped.swap(q_);
-        }
-        cv_.notify_all();
+        stop_ = true;
+        e_.wake();
         th_.join();
-        // `dropped` goes last: pending responses end as their handles are released.
     }
-    // `make(ahead)` builds the job, knowing how many jobs are ahead of it.
-    // Returns that count.
-    size_t submit(const std::function<std::function<void()>(size_t)>& make) {
-        std::lock_guard<std::mutex> lk(mu_);
-        const size_t ahead = q_.size() + (busy_ ? 1 : 0);
-        q_.push_back(make(ahead));
-        cv_.notify_one();
-        return ahead;
-    }
-    size_t depth() const { std::lock_guard<std::mutex> lk(mu_); return q_.size() + (busy_ ? 1 : 0); }
 private:
     void loop() {
-        for (;;) {
-            std::function<void()> job;
-            {
-                std::unique_lock<std::mutex> lk(mu_);
-                cv_.wait(lk, [&] { return stop_ || !q_.empty(); });
-                if (stop_) return;
-                job = std::move(q_.front());
-                q_.pop_front();
-                busy_ = true;
+        while (!stop_) {
+            try {
+                if (!e_.step()) e_.wait_for_work(1.0);
+            } catch (const std::exception& ex) {
+                std::fprintf(stderr, "[coral] worker: %s\n", ex.what());
             }
-            try { job(); } catch (const std::exception& e) { std::fprintf(stderr, "[coral] worker: %s\n", e.what()); }
-            job = nullptr;
-            std::lock_guard<std::mutex> lk(mu_);
-            busy_ = false;
         }
     }
-    mutable std::mutex mu_;
-    std::condition_variable cv_;
-    std::deque<std::function<void()>> q_;
-    bool busy_ = false, stop_ = false;
+    BatchEngine& e_;
+    std::atomic<bool> stop_{false};
     std::thread th_;   // last: started after the other members exist
 };
 
@@ -282,7 +261,10 @@ void parse_common(const Json& b, GenParams& g) {
 // ---- the API ----------------------------------------------------------------
 class Api {
 public:
-    Api(Engine& e, const ServerOptions& o) : engine_(e), tok_(e.tokenizer()), opts_(o) {
+    Api(Engine& e, const ServerOptions& o)
+        : be_(e.make_batch_engine(BatchOptions{std::clamp<uint32_t>(o.max_batch, 1, Model::kMaxDecodeBatch)})),
+          tok_(e.tokenizer()), opts_(o) {
+        if (be_->max_batch() > 1) be_->warmup();
         ret_ = tok_.special("<|return|>");
         call_ = tok_.special("<|call|>");
         eot_ = tok_.special("<|endoftext|>");
@@ -307,7 +289,8 @@ private:
 
     void health(const HttpRequest&, HttpResponse& r) {
         json_reply(r, Json::Object{{"status", "ok"}, {"model", opts_.model_name}, {"device", opts_.device_name},
-                                   {"queue", int64_t(worker.depth())}});
+                                   {"active", int64_t(be_->active())}, {"queue", int64_t(be_->queued())},
+                                   {"max_batch", int64_t(be_->max_batch())}});
     }
     Json model_obj() const {
         return Json::Object{{"id", opts_.model_name}, {"object", "model"}, {"created", int64_t(0)}, {"owned_by", "coral"}};
@@ -370,37 +353,52 @@ private:
         return b;
     }
 
-    Json usage(const GenerationStats& st) const {
+    static Json usage(const GenerationStats& st) {
         return Json::Object{{"prompt_tokens", int64_t(st.prompt_tokens)},
                             {"completion_tokens", int64_t(st.generated_tokens)},
                             {"total_tokens", int64_t(st.prompt_tokens) + int64_t(st.generated_tokens)}};
     }
 
-    // Queue `fn` on the worker; errors thrown there become 500s (or an SSE error event).
-    template <class Fn>
-    void enqueue(HttpResponse& r, bool stream, Fn fn) {
-        std::shared_ptr<HttpResponse> h = r.defer();
-        const size_t ahead = worker.submit([&](size_t n) -> std::function<void()> {
-            return [h, stream, fn = std::move(fn), n]() mutable {
-            if (h->client_gone()) { h->annotate("dropped from queue: client gone"); h->end(); return; }
-            try {
-                fn(*h, n);
-            } catch (const std::exception& e) {
-                if (!h->headers_sent()) send_json_error(*h, 500, e.what(), "server_error", "generation_failed");
-                else {
-                    if (stream)
-                        sse(*h, Json::Object{{"error", Json::Object{{"message", std::string(e.what())},
-                                                                    {"type", "server_error"}, {"code", Json()}}}});
-                    h->end();
-                }
-            }
-            };
-        });
-        // Streaming clients learn their queue position at once (SSE comment, ignored by parsers).
-        if (stream && ahead > 0) {
-            sse_headers(*h);
-            h->write(": queued, position " + std::to_string(ahead) + "\n\n");
+    // A request in flight: its response handle and the per-request stream
+    // state. on_token / finish run on the worker thread (BatchEngine::step).
+    struct Session {
+        std::shared_ptr<HttpResponse> h;
+        bool stream = false;
+        size_t ahead = 0;
+        virtual ~Session() = default;
+        virtual bool on_token(int32_t t) = 0;
+        virtual void finish(FinishReason why, const GenerationStats& st) = 0;
+        // Errors before any token: a JSON 500, or an SSE error event once streaming.
+        void fail(const char* msg) {
+            if (!h->headers_sent()) { send_json_error(*h, 500, msg, "server_error", "generation_failed"); return; }
+            if (stream)
+                sse(*h, Json::Object{{"error", Json::Object{{"message", std::string(msg)}, {"type", "server_error"},
+                                                            {"code", Json()}}}});
+            h->end();
         }
+    };
+
+    // Defers the response and submits the session's sequence.
+    void submit(HttpResponse& r, std::shared_ptr<Session> sess, GenerationRequest req) {
+        sess->h = r.defer();
+        const size_t busy = be_->active() + be_->queued();
+        sess->ahead = busy >= be_->max_batch() ? busy - be_->max_batch() + 1 : 0;
+        // Streaming clients learn their queue position at once (SSE comment, ignored by parsers).
+        if (sess->stream && sess->ahead > 0) {
+            sse_headers(*sess->h);
+            sess->h->write(": queued, position " + std::to_string(sess->ahead) + "\n\n");
+        }
+        std::shared_ptr<HttpResponse> h = sess->h;
+        be_->submit(std::move(req), [sess](int32_t t) { return sess->on_token(t); },
+                    [sess](FinishReason why, const GenerationStats& st) {
+                        try {
+                            sess->finish(why, st);
+                        } catch (const std::exception& e) {
+                            std::fprintf(stderr, "[coral] session: %s\n", e.what());
+                            sess->h->end();
+                        }
+                    },
+                    [h] { return !h->client_gone(); });
     }
 
     // ---- /v1/chat/completions -------------------------------------------
@@ -519,40 +517,48 @@ private:
         size_request(g, req);
         req.stop_tokens = {ret_, call_};
 
-        const std::string id = "chatcmpl-" + random_hex(24);
-        const int64_t created = unix_now();
-        Api* self = this;
-        enqueue(r, g.stream, [self, g = std::move(g), req = std::move(req), id, created](HttpResponse& h, size_t ahead) {
-            self->run_chat(g, req, id, created, h, ahead);
-        });
+        auto sess = std::make_shared<ChatSession>(*this, std::move(g), "chatcmpl-" + random_hex(24), unix_now());
+        sess->stream = sess->g.stream;
+        submit(r, sess, std::move(req));
     }
 
-    void run_chat(const GenParams& g, const GenerationRequest& req, const std::string& id, int64_t created,
-                  HttpResponse& h, size_t ahead) {
-        const bool stream = g.stream;
-        auto chunk = [&](Json delta, Json finish) {
-            Json::Object choice{{"index", 0}, {"delta", std::move(delta)}, {"finish_reason", std::move(finish)},
-                                {"logprobs", Json()}};
-            sse(h, Json::Object{{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
-                                {"model", opts_.model_name}, {"system_fingerprint", "coral"},
-                                {"choices", Json::Array{Json(std::move(choice))}}});
-        };
-        if (stream) {
-            if (!h.headers_sent()) sse_headers(h);
-            chunk(Json::Object{{"role", "assistant"}, {"content", ""}}, Json());
-        }
-
+    struct ChatSession final : Session {
+        Api& api;
+        GenParams g;
+        std::string id;
+        int64_t created;
         std::string content, reasoning;
         Json::Array calls;
-        StopFilter filter(g.stop);
+        StopFilter filter;
         bool stopped_by_text = false;
-        harmony::Parser parser(tok_);
-        auto emit_content = [&](const std::string& s) {
+        harmony::Parser parser;
+        bool started = false;
+
+        ChatSession(Api& a, GenParams gp, std::string i, int64_t c)
+            : api(a), g(std::move(gp)), id(std::move(i)), created(c), filter(g.stop), parser(a.tok_) {}
+
+        void chunk(Json delta, Json finish) {
+            Json::Object choice{{"index", 0}, {"delta", std::move(delta)}, {"finish_reason", std::move(finish)},
+                                {"logprobs", Json()}};
+            sse(*h, Json::Object{{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
+                                 {"model", api.opts_.model_name}, {"system_fingerprint", "coral"},
+                                 {"choices", Json::Array{Json(std::move(choice))}}});
+        }
+        void begin() {
+            if (started) return;
+            started = true;
+            if (stream) {
+                if (!h->headers_sent()) sse_headers(*h);
+                chunk(Json::Object{{"role", "assistant"}, {"content", ""}}, Json());
+            }
+        }
+        void emit_content(const std::string& s) {
             if (s.empty()) return;
             content += s;
             if (stream) chunk(Json::Object{{"content", s}}, Json());
-        };
-        auto cb = [&](int32_t t) -> bool {
+        }
+        bool on_token(int32_t t) override {
+            begin();
             for (auto& ev : parser.push(t)) {
                 using K = harmony::Event::Kind;
                 if (ev.kind == K::Text) {
@@ -575,35 +581,37 @@ private:
                     calls.push_back(std::move(call));
                 }
             }
-            return !stopped_by_text && !h.client_gone();
-        };
-        GenerationStats st;
-        const FinishReason why = engine_.generate(req, cb, &st);
-        emit_content(filter.flush());
-        h.annotate(stats_note(st, ahead));
-        if (h.client_gone()) { h.end(); return; }
-
-        const std::string finish = !calls.empty() ? "tool_calls" : stopped_by_text ? "stop" : finish_name(why);
-        if (stream) {
-            chunk(Json::Object{}, finish);
-            if (g.include_usage)
-                sse(h, Json::Object{{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
-                                    {"model", opts_.model_name}, {"choices", Json::Array{}}, {"usage", usage(st)}});
-            h.write("data: [DONE]\n\n");
-            h.end();
-            return;
+            return !stopped_by_text && !h->client_gone();
         }
-        Json::Object msg{{"role", "assistant"},
-                         {"content", content.empty() && !calls.empty() ? Json() : Json(content)}};
-        if (!reasoning.empty()) msg["reasoning_content"] = reasoning;
-        if (!calls.empty()) msg["tool_calls"] = Json(std::move(calls));
-        json_reply(h, Json::Object{
-            {"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", opts_.model_name},
-            {"system_fingerprint", "coral"},
-            {"choices", Json::Array{Json::Object{{"index", 0}, {"message", Json(std::move(msg))},
-                                                 {"finish_reason", finish}, {"logprobs", Json()}}}},
-            {"usage", usage(st)}});
-    }
+        void finish(FinishReason why, const GenerationStats& st) override {
+            h->annotate(stats_note(st, ahead));
+            if (h->client_gone()) { h->end(); return; }
+            if (why == FinishReason::Error && !started) { fail("generation failed"); return; }
+            begin();
+            emit_content(filter.flush());
+            const std::string finish = !calls.empty() ? "tool_calls" : stopped_by_text ? "stop" : finish_name(why);
+            if (stream) {
+                chunk(Json::Object{}, finish);
+                if (g.include_usage)
+                    sse(*h, Json::Object{{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
+                                         {"model", api.opts_.model_name}, {"choices", Json::Array{}},
+                                         {"usage", usage(st)}});
+                h->write("data: [DONE]\n\n");
+                h->end();
+                return;
+            }
+            Json::Object msg{{"role", "assistant"},
+                             {"content", content.empty() && !calls.empty() ? Json() : Json(content)}};
+            if (!reasoning.empty()) msg["reasoning_content"] = reasoning;
+            if (!calls.empty()) msg["tool_calls"] = Json(std::move(calls));
+            json_reply(*h, Json::Object{
+                {"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", api.opts_.model_name},
+                {"system_fingerprint", "coral"},
+                {"choices", Json::Array{Json::Object{{"index", 0}, {"message", Json(std::move(msg))},
+                                                     {"finish_reason", finish}, {"logprobs", Json()}}}},
+                {"usage", usage(st)}});
+        }
+    };
 
     // ---- /v1/completions --------------------------------------------------
     void completions(const HttpRequest&, const Json& b, HttpResponse& r) {
@@ -633,66 +641,85 @@ private:
         req.stop_tokens = {ret_, call_};
         if (eot_ >= 0) req.stop_tokens.push_back(eot_);
 
-        const std::string id = "cmpl-" + random_hex(24);
-        const int64_t created = unix_now();
-        Api* self = this;
-        enqueue(r, g.stream, [self, g = std::move(g), req = std::move(req), id, created, echo_text](HttpResponse& h, size_t ahead) {
-            self->run_completion(g, req, id, created, echo_text, h, ahead);
-        });
+        auto sess = std::make_shared<CompletionSession>(*this, std::move(g), "cmpl-" + random_hex(24), unix_now(),
+                                                        echo_text, req.stop_tokens);
+        sess->stream = sess->g.stream;
+        submit(r, sess, std::move(req));
     }
 
-    void run_completion(const GenParams& g, const GenerationRequest& req, const std::string& id, int64_t created,
-                        const std::string& echo_text, HttpResponse& h, size_t ahead) {
-        const bool stream = g.stream;
-        auto chunk = [&](const std::string& text, Json finish) {
-            sse(h, Json::Object{{"id", id}, {"object", "text_completion"}, {"created", created}, {"model", opts_.model_name},
-                                {"choices", Json::Array{Json::Object{{"index", 0}, {"text", text}, {"logprobs", Json()},
-                                                                     {"finish_reason", std::move(finish)}}}}});
-        };
-        if (stream && !h.headers_sent()) sse_headers(h);
-        std::string text = echo_text;
-        if (stream && !echo_text.empty()) chunk(echo_text, Json());
-        StopFilter filter(g.stop);
+    struct CompletionSession final : Session {
+        Api& api;
+        GenParams g;
+        std::string id;
+        int64_t created;
+        std::string text;
+        StopFilter filter;
         Utf8Streamer utf8;
-        const std::unordered_set<int32_t> stops(req.stop_tokens.begin(), req.stop_tokens.end());
-        auto emit = [&](const std::string& s) {
+        std::unordered_set<int32_t> stops;
+        bool started = false;
+
+        CompletionSession(Api& a, GenParams gp, std::string i, int64_t c, const std::string& echo,
+                          const std::vector<int32_t>& stop_tokens)
+            : api(a), g(std::move(gp)), id(std::move(i)), created(c), text(echo), filter(g.stop),
+              stops(stop_tokens.begin(), stop_tokens.end()) {}
+
+        void chunk(const std::string& t, Json finish) {
+            sse(*h, Json::Object{{"id", id}, {"object", "text_completion"}, {"created", created},
+                                 {"model", api.opts_.model_name},
+                                 {"choices", Json::Array{Json::Object{{"index", 0}, {"text", t}, {"logprobs", Json()},
+                                                                      {"finish_reason", std::move(finish)}}}}});
+        }
+        void begin() {
+            if (started) return;
+            started = true;
+            if (stream) {
+                if (!h->headers_sent()) sse_headers(*h);
+                if (!text.empty()) chunk(text, Json());   // echo
+            }
+        }
+        void emit(const std::string& s) {
             if (s.empty()) return;
             text += s;
             if (stream) chunk(s, Json());
-        };
-        auto cb = [&](int32_t t) -> bool {
-            if (stops.count(t)) return true;
-            emit(filter.push(utf8.push(tok_.token_bytes(t))));
-            return !filter.hit() && !h.client_gone();
-        };
-        GenerationStats st;
-        const FinishReason why = engine_.generate(req, cb, &st);
-        emit(filter.push(utf8.flush()));
-        emit(filter.flush());
-        h.annotate(stats_note(st, ahead));
-        if (h.client_gone()) { h.end(); return; }
-        const std::string finish = filter.hit() ? "stop" : finish_name(why);
-        if (stream) {
-            chunk("", finish);
-            if (g.include_usage)
-                sse(h, Json::Object{{"id", id}, {"object", "text_completion"}, {"created", created},
-                                    {"model", opts_.model_name}, {"choices", Json::Array{}}, {"usage", usage(st)}});
-            h.write("data: [DONE]\n\n");
-            h.end();
-            return;
         }
-        json_reply(h, Json::Object{
-            {"id", id}, {"object", "text_completion"}, {"created", created}, {"model", opts_.model_name},
-            {"choices", Json::Array{Json::Object{{"index", 0}, {"text", text}, {"logprobs", Json()}, {"finish_reason", finish}}}},
-            {"usage", usage(st)}});
-    }
+        bool on_token(int32_t t) override {
+            begin();
+            if (stops.count(t)) return true;
+            emit(filter.push(utf8.push(api.tok_.token_bytes(t))));
+            return !filter.hit() && !h->client_gone();
+        }
+        void finish(FinishReason why, const GenerationStats& st) override {
+            h->annotate(stats_note(st, ahead));
+            if (h->client_gone()) { h->end(); return; }
+            if (why == FinishReason::Error && !started) { fail("generation failed"); return; }
+            begin();
+            emit(filter.push(utf8.flush()));
+            emit(filter.flush());
+            const std::string finish = filter.hit() ? "stop" : finish_name(why);
+            if (stream) {
+                chunk("", finish);
+                if (g.include_usage)
+                    sse(*h, Json::Object{{"id", id}, {"object", "text_completion"}, {"created", created},
+                                         {"model", api.opts_.model_name}, {"choices", Json::Array{}},
+                                         {"usage", usage(st)}});
+                h->write("data: [DONE]\n\n");
+                h->end();
+                return;
+            }
+            json_reply(*h, Json::Object{
+                {"id", id}, {"object", "text_completion"}, {"created", created}, {"model", api.opts_.model_name},
+                {"choices", Json::Array{Json::Object{{"index", 0}, {"text", text}, {"logprobs", Json()},
+                                                     {"finish_reason", finish}}}},
+                {"usage", usage(st)}});
+        }
+    };
 
-    Engine& engine_;
+    std::unique_ptr<BatchEngine> be_;
     const Tokenizer& tok_;
     ServerOptions opts_;
     int32_t ret_ = -1, call_ = -1, eot_ = -1;
     uint32_t max_pos_ = 0;
-    Worker worker;   // last: destroyed (joined) first, while everything it uses is alive
+    Worker worker{*be_};   // last: destroyed (joined) first, while everything it uses is alive
 };
 
 } // namespace

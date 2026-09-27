@@ -479,3 +479,106 @@ CORAL_TEST(server_openai_tool_call) {
                 ch2["message"]["content"].is_string() ? ch2["message"]["content"].as_string().c_str() : "(null)");
     CHECK(ch2["finish_reason"].as_string() == "stop" || ch2["finish_reason"].as_string() == "tool_calls");
 }
+
+// ---------------------------------------------------------------------------
+// Continuous batching through the server
+// ---------------------------------------------------------------------------
+namespace {
+
+Json chat_req(const std::string& content, uint32_t max_tokens) {
+    return Json::Object{{"model", "gpt-oss-20b"},
+                        {"messages", Json::Array{Json::Object{{"role", "user"}, {"content", content}}}},
+                        {"reasoning_effort", "low"}, {"temperature", 0}, {"max_tokens", int64_t(max_tokens)},
+                        {"stream", true}};
+}
+
+struct Streamed { std::string content, reasoning, finish; int status = 0; double seconds = 0; };
+
+// One streaming chat request; `stop_after` > 0 closes the connection after that many chunks.
+Streamed stream_chat(uint16_t port, const Json& body, size_t stop_after = 0) {
+    Streamed out;
+    const auto t0 = clk::now();
+    Client c(port);
+    c.request("POST", "/v1/chat/completions", body.dump());
+    size_t n = 0;
+    Reply rep = c.read_reply([&](const std::string&) { return !stop_after || ++n < stop_after; });
+    out.status = rep.status;
+    if (stop_after) { c.close(); return out; }
+    for (const Json& e : sse_events(rep.body)) {
+        if (e["choices"].size() == 0) continue;
+        const Json& d = e["choices"][0]["delta"];
+        out.content += d.get_string("content", "");
+        out.reasoning += d.get_string("reasoning_content", "");
+        if (e["choices"][0]["finish_reason"].is_string()) out.finish = e["choices"][0]["finish_reason"].as_string();
+    }
+    out.seconds = std::chrono::duration<double>(clk::now() - t0).count();
+    return out;
+}
+
+const char* kPrompts[] = {"Name three primes and explain briefly why they are prime.",
+                          "Write a haiku about the sea.",
+                          "What is the capital of Japan, and what is it famous for?",
+                          "Explain in two sentences what a hash table is."};
+
+} // namespace
+
+// 4 concurrent streaming chat requests (greedy): each output equals the same
+// request run alone, and the wall time is well below running them one after
+// another.
+CORAL_TEST(server_batch_concurrent_streams) {
+    test::model_dir_or_skip();
+    ApiServer s;
+    const uint32_t max_tokens = 160;
+    std::vector<Streamed> alone;
+    double sum = 0;
+    for (const char* p : kPrompts) {
+        alone.push_back(stream_chat(s.port(), chat_req(p, max_tokens)));
+        CHECK_EQ(alone.back().status, 200);
+        sum += alone.back().seconds;
+    }
+    std::vector<Streamed> conc(4);
+    const auto t0 = clk::now();
+    std::vector<std::thread> th;
+    for (int i = 0; i < 4; ++i)
+        th.emplace_back([&, i] { conc[i] = stream_chat(s.port(), chat_req(kPrompts[i], max_tokens)); });
+    for (auto& t : th) t.join();
+    const double wall = std::chrono::duration<double>(clk::now() - t0).count();
+    for (int i = 0; i < 4; ++i) {
+        std::printf("        [%d] alone %.2f s, concurrent %.2f s, finish %s, content \"%.60s\"\n", i, alone[i].seconds,
+                    conc[i].seconds, conc[i].finish.c_str(), conc[i].content.c_str());
+        CHECK_EQ(conc[i].status, 200);
+        CHECK_EQ(conc[i].content, alone[i].content);
+        CHECK_EQ(conc[i].reasoning, alone[i].reasoning);
+        CHECK_EQ(conc[i].finish, alone[i].finish);
+    }
+    std::printf("        4 requests one after another: %.2f s; concurrently: %.2f s (%.2fx)\n", sum, wall, sum / wall);
+    CHECK(wall < 0.8 * sum);
+}
+
+// A client that disconnects mid-stream cancels only its own sequence; the
+// others complete with the same output as alone.
+CORAL_TEST(server_batch_disconnect_one) {
+    test::model_dir_or_skip();
+    ApiServer s;
+    const uint32_t max_tokens = 120;
+    const Streamed a0 = stream_chat(s.port(), chat_req(kPrompts[1], max_tokens));
+    const Streamed a2 = stream_chat(s.port(), chat_req(kPrompts[3], max_tokens));
+    Streamed r0, r2, r1;
+    std::thread t0([&] { r0 = stream_chat(s.port(), chat_req(kPrompts[1], max_tokens)); });
+    std::thread t1([&] { r1 = stream_chat(s.port(), chat_req(kPrompts[0], 400), /*stop_after=*/5); });
+    std::thread t2([&] { r2 = stream_chat(s.port(), chat_req(kPrompts[3], max_tokens)); });
+    t0.join(); t1.join(); t2.join();
+    CHECK_EQ(r0.content, a0.content);
+    CHECK_EQ(r2.content, a2.content);
+    CHECK_EQ(r0.reasoning, a0.reasoning);
+    // The server notices the disconnect and goes idle (the 400-token request does not run on).
+    Client h(s.port());
+    int64_t busy = 1;
+    for (int i = 0; i < 100 && busy; ++i) {
+        h.request("GET", "/health");
+        const Json j = Json::parse(h.read_reply().body);
+        busy = j["active"].as_int() + j["queue"].as_int();
+        if (busy) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK_EQ(busy, int64_t(0));
+}

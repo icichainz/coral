@@ -1,6 +1,6 @@
 // Generation engine: sampling, stop handling, streaming callbacks, and the
-// scheduler that will later interleave multiple sequences (continuous
-// batching) on one GPU stream.
+// continuous-batching scheduler (BatchEngine) that interleaves many
+// sequences on one GPU stream.
 //
 // Single-sequence generation (src/engine/engine.cpp): prefill the prompt,
 // then one command buffer per generated token. Greedy decoding
@@ -60,6 +60,13 @@ struct GenerationStats {
 
 // Called for every generated token. Return false to cancel.
 using TokenCallback = std::function<bool(int32_t token)>;
+// Called once when a sequence ends (stop token, length, cancellation, error).
+using FinishCallback = std::function<void(FinishReason, const GenerationStats&)>;
+
+class BatchEngine;
+struct BatchOptions {
+    uint32_t max_batch = 8;     // sequences decoding together, 1..Model::kMaxDecodeBatch
+};
 
 class Engine {
 public:
@@ -78,7 +85,57 @@ public:
     // step so every weight page and scratch buffer is touched.
     virtual void warmup() = 0;
 
+    // A continuous-batching engine over the same device and model (and
+    // tokenizer). Not for concurrent use with generate(): the model is not
+    // thread-safe, so drive one engine at a time.
+    virtual std::unique_ptr<BatchEngine> make_batch_engine(const BatchOptions& opt = {}) = 0;
+
     static constexpr uint32_t kDefaultKvCapacity = 8192;
+};
+
+// Continuous batching (src/engine/batch_engine.cpp). Requests are queued from
+// any thread; one driver thread calls step() in a loop. A step admits queued
+// requests while fewer than max_batch sequences are active — each is
+// prefilled in full (its first token comes from the prefill logits) — then
+// runs ONE decode step for all active sequences (Model::decode_batch: one
+// command buffer, dense weights read once for all of them; a lone sequence
+// takes the single-sequence path, pipelined when greedy), samples each row
+// (GPU argmax when greedy, the CPU sampler on that row's logits otherwise),
+// delivers the tokens and retires finished sequences, whose KV caches go
+// back to a pool. Greedy results match Engine::generate token for token
+// (tests/test_batch.cpp).
+class BatchEngine {
+public:
+    static std::unique_ptr<BatchEngine> create(gpu::Device& dev, std::shared_ptr<Model> model,
+                                               const BatchOptions& opt = {});
+    virtual ~BatchEngine() = default;
+
+    virtual const Model& model() const = 0;
+    virtual uint32_t max_batch() const = 0;
+
+    // Thread-safe. Queues `req`; returns its id. on_token runs on the step()
+    // thread for every generated token (return false to stop); on_finish runs
+    // exactly once on that thread, also for cancelled and failed requests.
+    // `alive`, if given, is polled on the step() thread before admission and
+    // at every step: false cancels the sequence without waiting for a token
+    // (e.g. the HTTP client went away).
+    virtual uint64_t submit(GenerationRequest req, TokenCallback on_token, FinishCallback on_finish,
+                            std::function<bool()> alive = {}) = 0;
+    // Thread-safe: the sequence finishes with FinishReason::Cancelled at the next step.
+    virtual void cancel(uint64_t id) = 0;
+
+    // One scheduling iteration (single driver thread). Returns true while
+    // sequences are queued or active.
+    virtual bool step() = 0;
+    void run_until_idle() { while (step()) {} }
+    // Blocks until work is queued, wake() is called, or the timeout passes;
+    // returns true if there is work.
+    virtual bool wait_for_work(double timeout_seconds) = 0;
+    virtual void wake() = 0;                  // thread-safe
+
+    virtual size_t active() const = 0;        // thread-safe: sequences decoding
+    virtual size_t queued() const = 0;        // thread-safe: waiting for admission
+    virtual void warmup() = 0;                // one throwaway batched step (driver thread)
 };
 
 // Sampler: fp32 logits -> token id. CPU implementation for the vocabulary

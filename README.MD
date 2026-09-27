@@ -65,6 +65,9 @@ echo "Name three primes." | ./build/coral run models/gpt-oss-20b --temp 0.7 --to
 # (from Model::decode_bytes_per_token), host encode time and dispatches/token.
 ./build/coral bench models/gpt-oss-20b -n 2048 --report-every 512
 ./build/coral bench models/gpt-oss-20b -n 128 --ctx 1000     # 1000-token prompt first
+# Continuous batching: B concurrent greedy sequences (different prompts of
+# --ctx tokens) through the BatchEngine: aggregate tok/s, ms per step.
+./build/coral bench models/gpt-oss-20b --batch 4 -n 256 --ctx 500
 ```
 
 `run` options: `-p/--prompt` (default: stdin), `-n/--max-tokens`, `--temp`
@@ -116,6 +119,32 @@ Stage benchmarks: `CORAL_MOE_BENCH=1 coral_tests moe_bench`,
 `CORAL_PF_PROFILE=1 coral_tests prefill_zz` (batched-prefill stages per chunk
 size, token-vs-batched crossover).
 
+Continuous batching (`coral bench --batch B -n 256 --ctx 500`, M2 Max, B
+sequences with different 500-token prompts decoding together, greedy):
+
+| B | ms/step | aggregate tok/s | tok/s per sequence | at ctx 2000 |
+|---|---|---|---|---|
+| 1 | 10.0 | 100 | 100 | |
+| 2 | 14.7 | 136 | 68 | |
+| 4 | 21.1 | 190 | 47 | 176 tok/s |
+| 8 | 33.4 | 240 | 30 | 219 tok/s |
+
+Where a B = 8 step goes (all 24 layers, `CORAL_BATCH_PROFILE=1 coral_tests
+batch_zz_profile`): experts 22.1 ms (gate_up 14.2 + down 7.9), QKV 2.7,
+o_proj 2.1, attention 1.9, lm_head 1.8, router 0.3. Dense weights are read
+once per step for all rows, so they scale well; the experts do not: 8 rows
+select ~12 distinct experts per layer on real text (~21 if routing were
+uniform), a DRAM floor of ~11.6 ms, and the expert GEMVs of a step are
+compute-issue bound at about twice that (`sb_gate_up` in
+`src/kernels/seq_batch.metal` lists the variants measured).
+
+Batched decode is exact: every kernel but the B >= 3 lm_head keeps the
+single-sequence per-row arithmetic, so a sequence's hidden states and KV
+cache are bitwise those of decoding it alone, and its greedy tokens match
+(tests/test_batch.cpp: 100% of 32 free-running steps at B = 2, 3, 4, 8;
+logits bitwise equal at B = 2, within 4e-6 relative with the B >= 3 MMA
+lm_head; the mlx-lm reference prompts batched give the single path's tokens).
+
 Batched prefill (`src/model/prefill_ops.h`): prompts of >= 6 tokens run in
 chunks of up to 1024 positions, one command buffer per chunk (277 dispatches:
 per layer rmsnorm, fused QKV GEMM, RoPE + KV staging, flash attention with
@@ -135,7 +164,12 @@ curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' \
 
 The API is OpenAI-compatible: analysis-channel text arrives as
 `reasoning_content`, the final channel as `content`, and Harmony tool calls as
-`tool_calls`. One request generates at a time; others queue in order.
+`tool_calls`. Requests are batched continuously: up to `--max-batch N`
+(default 8, max 8) sequences decode together in one command buffer per step,
+the rest wait in order; a new request is prefilled between two decode steps
+(pausing the others for the length of its prefill). A client that
+disconnects cancels only its own sequence. Greedy outputs are the same as
+with the request alone.
 
 ## Layout
 
@@ -149,24 +183,25 @@ include/coral/     public C++ interfaces (one header per module)
   tokenizer.h      BPE tokenizer interface, Utf8Streamer       [interface]
   harmony.h        Harmony chat format render/parse
   model.h          gpt-oss forward pass (decode/prefill), KVCache
-  engine.h         generation loop, sampler
+  engine.h         generation loop, sampler, BatchEngine (continuous batching)
   server.h         kqueue HTTP/1.1 + OpenAI-compatible API
 src/
   gpu/metal_backend.mm   Metal 4 implementation of gpu.h
   gpu/kernels.cpp        includes the generated shaders.inc
   kernels/               MSL: gemv_bf16, gemv_int8, gemv_mxfp4, moe, attention, rope,
                          norm, embed, embed_f32, mxfp4, smoke, zz_lab (dev roofline),
-                         prefill_gemm, prefill_attn, prefill_moe (batched prefill)
-                         (+ common.h, prefill_core.h)
+                         prefill_gemm, prefill_attn, prefill_moe (batched prefill),
+                         seq_batch (multi-sequence decode) (+ common.h, prefill_core.h)
   model/attention_ops.*  attention half of a layer (3 dispatches)
   model/gemv_i8.*        int8 lm_head: load-time quantization + GEMV
   model/moe_ops.*        MoE half of a layer (3 dispatches)
   model/prefill_ops.*    batched prefill (M > 1): GEMMs, attention, grouped MoE
+  model/batch_ops.*      multi-sequence decode: B sequences, one step, own KV caches
   model/weights.*        zero-copy tensor binding
   loader/safetensors.cpp
   model/config.cpp, model/gptoss.cpp
   tokenizer/tokenizer.cpp, tokenizer/harmony.cpp
-  engine/engine.cpp
+  engine/engine.cpp, engine/batch_engine.cpp
   server/http.cpp, server/openai_api.cpp
   main.cpp               CLI: info | selftest | inspect | run | bench | serve
 tools/embed_shaders.cpp  build step: .metal -> shaders.inc
@@ -213,7 +248,7 @@ scripts/                 Python dev tooling
    chunked SSE, keep-alive, backpressure, client-disconnect cancellation),
    `/v1/chat/completions` (streaming and not, `reasoning_content`, tools and
    `tool_calls`, `reasoning_effort`), `/v1/completions`, `/v1/models`,
-   `/health`. Continuous batching across requests is future work.
+   `/health`. Continuous batching across requests: step 8.
 7. **Tuning** — decode path done (13.4 -> ~10.0 ms/token): MXFP4 GEMVs with
    a 4-lanes-per-block mapping (MoE 235 -> 173 us/layer), int8 lm_head
    (3.2 -> 1.6 ms), attention split merge fused into the split kernel and
@@ -221,5 +256,14 @@ scripts/                 Python dev tooling
    decode hiding host encode + submit latency. Batched prefill done (~117 ->
    ~900-1030 prompt tok/s at 512-2048 tokens): simdgroup-matrix GEMMs,
    grouped MXFP4 expert GEMMs over a GPU counting sort, flash attention with
-   sinks and a chunk-safe sliding ring. Next: speculative decoding, Metal 4
-   binary archives for instant startup, gpt-oss-120b.
+   sinks and a chunk-safe sliding ring.
+8. **Continuous batching** — done: `Model::decode_batch` (B <= 8 sequences,
+   each at its own position in its own KV cache, one command buffer per step;
+   kernels in `src/kernels/seq_batch.metal`, per-row cache addresses read by
+   the kernels from a small table), `BatchEngine` (admission with full
+   prefill between steps, pooled KV caches, per-row greedy / sampling,
+   cancellation), the server on top of it (`--max-batch`), `coral bench
+   --batch`. 100 -> 190 / 240 aggregate tok/s at B = 4 / 8, bitwise-exact
+   hidden states; the experts (~12 distinct per layer at B = 8) are now the
+   bottleneck. Next: speculative decoding, Metal 4 binary archives for
+   instant startup, gpt-oss-120b.

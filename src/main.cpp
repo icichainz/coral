@@ -47,10 +47,11 @@ int usage() {
         "                          generate text; prompt from -p or stdin. Harmony chat by\n"
         "                          default (analysis to stderr, final answer to stdout);\n"
         "                          --raw feeds the prompt tokens as-is and prints the continuation\n"
-        "  bench <model_dir> [-n tokens] [--ctx N] [--report-every K]\n"
-        "                          greedy decode benchmark: ms/token, tok/s, GB/s\n"
+        "  bench <model_dir> [-n tokens] [--ctx N] [--report-every K] [--batch B]\n"
+        "                          greedy decode benchmark: ms/token, tok/s, GB/s; --batch B\n"
+        "                          runs B concurrent sequences (continuous batching)\n"
         "  serve <model_dir> [--host H] [--port P] [--model-name N] [--ctx N]\n"
-        "                  [--reasoning low|medium|high] [--max-connections N]\n"
+        "                  [--reasoning low|medium|high] [--max-connections N] [--max-batch N]\n"
         "                          OpenAI-compatible HTTP server (/v1/chat/completions,\n"
         "                          /v1/completions, /v1/models, /health); Ctrl-C stops\n");
     return 2;
@@ -297,13 +298,67 @@ int cmd_run(int argc, char** argv) {
     return 0;
 }
 
+// B concurrent greedy sequences with different prompts through the
+// BatchEngine: prefill all, then decode n tokens each in lock step.
+int bench_batch(Loaded& L, uint32_t B, uint32_t n, uint32_t ctx) {
+    static const char* topics[] = {
+        "The history of the Roman Empire begins with", "Photosynthesis is the process by which plants",
+        "In 1969, the Apollo 11 mission", "The recipe for a good sourdough bread starts with",
+        "Quantum entanglement describes a situation where", "Once upon a time in a small village by the sea,",
+        "The stock market crash of 1929 was caused by", "A hash table is a data structure that"};
+    static const char* fill[] = {
+        " Scholars have long debated the causes, the consequences and the people involved.",
+        " Light energy is captured by chlorophyll and converted into chemical energy.",
+        " Neil Armstrong and Buzz Aldrin walked on the surface while Michael Collins orbited.",
+        " Flour, water, salt and a lively starter are mixed and left to rise overnight.",
+        " Measuring one particle instantly tells you something about the other one.",
+        " There lived a fisherman who every morning pushed his boat into the grey waves.",
+        " Speculation, margin buying and a fragile banking system all played a role.",
+        " Keys are hashed to buckets, and collisions are resolved by chaining or probing."};
+    auto be = L.engine->make_batch_engine(BatchOptions{B});
+    be->warmup();
+    uint64_t done = 0;
+    size_t prompt_total = 0;
+    for (uint32_t b = 0; b < B; ++b) {
+        GenerationRequest r;
+        r.prompt = L.tok->encode(topics[b % 8]);
+        if (ctx > 0) {
+            const auto f = L.tok->encode(fill[b % 8]);
+            while (r.prompt.size() < ctx) r.prompt.insert(r.prompt.end(), f.begin(), f.end());
+            r.prompt.resize(ctx);
+        }
+        prompt_total += r.prompt.size();
+        r.max_new_tokens = n + 1;                   // + the token from the prefill
+        r.sampling.temperature = 0;
+        r.kv_capacity = uint32_t(r.prompt.size()) + n + 8;
+        be->submit(std::move(r), nullptr, [&](FinishReason, const GenerationStats&) { ++done; });
+    }
+    auto t0 = clk::now();
+    be->step();                                     // admits (prefills) all B, then one decode step
+    const double prefill = since(t0);
+    std::printf("device        %s\n", L.dev->info().name.c_str());
+    std::printf("batch         %u sequences, prompts %zu tokens total, admission (prefill + 1 step) %.1f ms\n", B,
+                prompt_total, prefill * 1e3);
+    t0 = clk::now();
+    uint32_t steps = 0;
+    while (be->step()) ++steps;
+    ++steps;                                        // the step that finished the last sequences
+    const double wall = since(t0);
+    std::printf("decode        %u steps x %u sequences in %.2f s: %.2f ms/step, %.1f tok/s aggregate, "
+                "%.1f tok/s per sequence\n", steps, B, wall, wall * 1e3 / steps, double(steps) * B / wall, steps / wall);
+    return done == B ? 0 : 1;
+}
+
 int cmd_bench(int argc, char** argv) {
     Opts o(argc, argv, 2, {});
     if (o.pos.size() != 1) return usage();
     const uint32_t n = uint32_t(std::stoul(o.get("-n", "--tokens", "256")));
     const uint32_t ctx = uint32_t(std::stoul(o.get("--ctx", "-c", "0")));   // prompt length (0 = short prompt)
     const uint32_t every = uint32_t(std::stoul(o.get("--report-every", "-r", "0")));
+    const uint32_t batch = uint32_t(std::stoul(o.get("--batch", "-b", "0")));
+    if (batch > Model::kMaxDecodeBatch) throw std::invalid_argument("--batch must be 1.." + std::to_string(Model::kMaxDecodeBatch));
     Loaded L = load_all(o.pos[0]);
+    if (batch > 0) return bench_batch(L, batch, n, ctx);
     Model& m = *L.model;
 
     // Prompt: a short sentence, or text repeated to exactly `ctx` tokens.
@@ -366,6 +421,9 @@ int cmd_serve(int argc, char** argv) {
     so.kv_capacity = uint32_t(std::stoul(o.get("--ctx", "-c", "0")));
     so.default_reasoning = o.get("--reasoning", "-r", "medium");
     so.max_connections = uint32_t(std::stoul(o.get("--max-connections", "", "256")));
+    so.max_batch = uint32_t(std::stoul(o.get("--max-batch", "-b", "8")));
+    if (so.max_batch < 1 || so.max_batch > Model::kMaxDecodeBatch)
+        throw std::invalid_argument("--max-batch must be 1.." + std::to_string(Model::kMaxDecodeBatch));
     if (so.default_reasoning != "low" && so.default_reasoning != "medium" && so.default_reasoning != "high")
         throw std::invalid_argument("--reasoning must be low, medium or high");
     so.handle_signals = true;
@@ -376,8 +434,9 @@ int cmd_serve(int argc, char** argv) {
     so.device_name = L.dev->info().name;
     install_openai_api(*server, *L.engine, so);
     const bool v6 = so.host.find(':') != std::string::npos;
-    std::fprintf(stderr, "[coral] serving %s on http://%s%s%s:%u/v1  (Ctrl-C to stop)\n", so.model_name.c_str(),
-                 v6 ? "[" : "", so.host.c_str(), v6 ? "]" : "", unsigned(server->port()));
+    std::fprintf(stderr, "[coral] serving %s on http://%s%s%s:%u/v1, up to %u concurrent sequences  (Ctrl-C to stop)\n",
+                 so.model_name.c_str(), v6 ? "[" : "", so.host.c_str(), v6 ? "]" : "", unsigned(server->port()),
+                 so.max_batch);
     server->run();
     server.reset();   // joins the generation worker before the engine goes away
     std::fprintf(stderr, "[coral] stopped\n");

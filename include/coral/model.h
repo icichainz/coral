@@ -29,6 +29,9 @@
 // GEMMs for the experts and a flash-attention kernel; only the last position
 // gets the unembedding. CORAL_PREFILL=token selects the token-by-token decode
 // path (16 tokens per command buffer) instead.
+// Several sequences decode together through encode_decode_batch (one command
+// buffer per step for all of them, 176 dispatches; see src/model/batch_ops.h)
+// — the engine's continuous batching (engine.h).
 #pragma once
 
 #include <cstdint>
@@ -128,6 +131,30 @@ public:
     // Bytes the GPU must read for one decode step (weights + KV) — used to
     // report achieved bandwidth in `coral bench`.
     virtual uint64_t decode_bytes_per_token(uint32_t context_len) const = 0;
+
+    // ---- multi-sequence decode (continuous batching) --------------------------
+    // One decode step for B = caches.size() independent sequences, 1 <= B <=
+    // kMaxDecodeBatch: row i consumes tokens[i] at position caches[i]->length
+    // of its own cache and bumps that length. Caches must be distinct.
+    //   logits_out  fp32 [B][vocab] (row stride vocab); allocated / grown if
+    //               too small. nullptr = internal buffer (needed for argmax).
+    //   argmax_out  int32 [B] greedy ids; allocated if invalid. nullptr = none.
+    // For B >= 2 the kernels are batched twins of the single-sequence ones
+    // with the same per-row arithmetic (src/model/batch_ops.h): each row's
+    // hidden states and KV-cache rows are bitwise those of decoding the
+    // sequence alone, and so are its logits for B = 2 (for B >= 3 the lm_head
+    // runs on simdgroup MMA: ~1e-6 relative). Dense weights are read once per
+    // step for all rows, each selected expert's gate_up once per tile of <= 2 rows.
+    // B == 1 is the single-sequence path.
+    // Throws std::out_of_range if a cache is full (nothing is recorded then).
+    static constexpr uint32_t kMaxDecodeBatch = 8;
+    virtual void encode_decode_batch(gpu::CommandStream& cs, std::span<KVCache* const> caches,
+                                     std::span<const int32_t> tokens, gpu::Buffer* logits_out,
+                                     gpu::Buffer* argmax_out);
+    // Synchronous form (begin / encode / submit / wait); `cs` must not be recording.
+    virtual void decode_batch(gpu::CommandStream& cs, std::span<KVCache* const> caches,
+                              std::span<const int32_t> tokens, gpu::Buffer* logits_out,
+                              gpu::Buffer* argmax_out, ForwardStats* stats = nullptr);
 };
 
 } // namespace coral
